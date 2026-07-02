@@ -16,6 +16,24 @@ def get_real_muons(file_path, num_samples=None):
         data = np.stack([px, py, pz, x_, y_, z_, pdg, weight], axis=1)
     return data
 
+def get_real_muons_per_weight(file_path, num_samples=None):
+    print(f"Loading data from {file_path}...")
+    data = {}
+    with h5py.File(file_path, 'r') as f:
+        for group_name in f.keys():
+            print(f"Group: {group_name}")
+            group = f[group_name]
+            weight = group.attrs['weight']
+            px = group['px'][:] if num_samples is None else group['px'][:num_samples]
+            py = group['py'][:] if num_samples is None else group['py'][:num_samples]
+            pz = group['pz'][:] if num_samples is None else group['pz'][:num_samples]
+            x_ = group['x'][:] if num_samples is None else group['x'][:num_samples]
+            y_ = group['y'][:] if num_samples is None else group['y'][:num_samples]
+            z_ = group['z'][:] if num_samples is None else group['z'][:num_samples]
+            pdg = group['pdg'][:] if num_samples is None else group['pdg'][:num_samples]
+            data[weight] = np.stack([px, py, pz, x_, y_, z_, pdg], axis=1)
+    return data
+
 def calc_pt(px, py):
     return np.sqrt(px**2 + py**2)
 

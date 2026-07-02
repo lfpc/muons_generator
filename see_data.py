@@ -25,70 +25,72 @@ def hist2d(x,y, W = None):
     cbar1 = fig.colorbar(im1, ax=ax)
     return ax
 
-if __name__ == "__main__": 
-    px,py,pz,_x,_y,z,pdg,weight = get_real_muons('/home/hep/lprate/projects/MuonsAndMatter/data/muons/full_sample.h5').T
-    pt = calc_pt(px, py)
-    phi = calc_phi(px, py)
-    x,y = generate_position(px.shape[0])
+if __name__ == "__main__":
+    data = get_real_muons_per_weight('/home/hep/lprate/projects/MuonsAndMatter/data/muons/full_sample_w.h5')
 
-    print(f"Number of samples: {px.shape[0]}")
-    print(f"Rate: {weight.sum()} muons per second")
+    for weight, arr in data.items():
+        px, py, pz = arr[:, 0], arr[:, 1], arr[:, 2]
+        print(f"Weight: {weight}, N: {px.shape[0]}, Rate: {weight * px.shape[0]:.2f} muons/s")
 
-    weights_unique = np.unique(weight)
-    weights_unique = weights_unique[weights_unique > 0]  # Filter out zero weights
-
+    # concatenate all weights for full-sample plots
+    all_arr = np.concatenate(list(data.values()), axis=0)
+    all_W   = np.concatenate([np.full(arr.shape[0], w) for w, arr in data.items()])
+    all_px, all_py, all_pz = all_arr[:, 0], all_arr[:, 1], all_arr[:, 2]
+    all_x, all_y, all_z   = all_arr[:, 3], all_arr[:, 4], all_arr[:, 5]
+    all_pt  = calc_pt(all_px, all_py)
+    all_phi = calc_phi(all_px, all_py)
+    gen_x, gen_y = generate_position(all_arr.shape[0])
 
     ######## momentum distribution
-    ax = hist2d(pz, pt, W=weight)
+    ax = hist2d(all_pz, all_pt, W=all_W)
     ax.set_xlabel('$P_z$ [GeV]', fontsize=fontsize)
     ax.set_ylabel('$P_t$ [GeV]', fontsize=fontsize)
     ax.set_xlim(0, 400)
     ax.set_ylim(0, 13)
-    plt.savefig(figs_dir+'momentum.png')
+    plt.savefig(figs_dir + 'momentum.png')
     if show: plt.show()
 
-    for w in weights_unique:
-        count = np.sum(weight == w)
-        print(f"Weight: {w}, Count: {count}")
-        ax = hist2d(pz[weight == w], pt[weight == w])
-        w = f"{w:.2f}".replace(".", "_")
+    for weight, arr in data.items():
+        px, py, pz = arr[:, 0], arr[:, 1], arr[:, 2]
+        pt = calc_pt(px, py)
+        ax = hist2d(pz, pt)
+        w_str = f"{weight:.2f}".replace(".", "_")
         ax.set_xlabel('$P_z$ [GeV]', fontsize=fontsize)
         ax.set_ylabel('$P_t$ [GeV]', fontsize=fontsize)
         ax.set_xlim(0, 400)
         ax.set_ylim(0, 13)
-        plt.title(f'Weight: {w}', fontsize=fontsize)
-        plt.savefig(figs_dir+f'momentum_weight_{w}.png')
+        plt.title(f'Weight: {weight:.2f}', fontsize=fontsize)
+        plt.savefig(figs_dir + f'momentum_weight_{w_str}.png')
         if show: plt.show()
 
-
     ##### z_dist
-    hist1d(z,log = True)
+    hist1d(all_z, W=all_W, log=True)
     target = -2.14
     plt.axvline(target, color='red', linestyle='--', label='Target Position')
-    plt.axvline(target+1.595, color='red', linestyle='--')
+    plt.axvline(target + 1.595, color='red', linestyle='--')
     plt.xlabel('z [cm]', fontsize=14)
-    plt.savefig(figs_dir+'z_dist.png')
+    plt.savefig(figs_dir + 'z_dist.png')
     if show: plt.show()
 
     ###### position_dist
-    hist2d(_x, _y)
+    hist2d(all_x, all_y, W=all_W)
     plt.xlabel('x [cm]', fontsize=14)
     plt.ylabel('y [cm]', fontsize=14)
     circ = plt.Circle((0, 0), 15, color='r', fill=False)
     plt.gca().add_patch(circ)
-    plt.savefig(figs_dir+'original_position_dist.png')
+    plt.savefig(figs_dir + 'original_position_dist.png')
     if show: plt.show()
 
-    hist2d(x, y)
+    hist2d(gen_x, gen_y)
     plt.xlabel('x [cm]', fontsize=14)
     plt.ylabel('y [cm]', fontsize=14)
     circ = plt.Circle((0, 0), 0.15, color='r', fill=False)
     plt.gca().add_patch(circ)
-    plt.savefig(figs_dir+'position_dist.png')
+    plt.savefig(figs_dir + 'position_dist.png')
     if show: plt.show()
 
     ##### phi distribution
-    hist1d(phi, density=True, histtype='step', log=False)
+    hist1d(all_phi, W=all_W, density=True, histtype='step', log=False)
     plt.xlabel('phi [rad]', fontsize=14)
-    plt.savefig(figs_dir+'phi_dist.png')
+    plt.savefig(figs_dir + 'phi_dist.png')
     if show: plt.show()

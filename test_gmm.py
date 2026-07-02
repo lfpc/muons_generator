@@ -20,7 +20,7 @@ with open(file_path, 'rb') as f:
 mean = gmm['mean']
 std = gmm['std']
 gmm = gmm['gmm']
-pz_gen, pt_gen, comp = sample_gmm(gmm, mean, std, n_samples=args.n_samples, seed=0)
+pz_gen, pt_gen, comp = sample_gmm(gmm, mean, std, n_samples=args.num_samples, seed=0)
 
 
 ######## momentum distribution
