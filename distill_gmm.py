@@ -19,18 +19,9 @@ figs_dir = 'outputs/figs/'
 
 def mixing_coefficients(models):
     """Combined model = sum_w alpha_w * p_w, with alpha_w proportional to the real
-    muon rate of group w, i.e. (importance weight) * (number of samples)."""
-    weights = np.array(list(models.keys()), dtype=float)
-    counts = [models[w].get("n") for w in models.keys()]
-
-    if any(c is None for c in counts):
-        print("WARNING: per-group sample counts ('n') not found in the model file; "
-              "falling back to mixing by importance weight only. Re-run train_gmm.py "
-              "to store counts for an exact combination.")
-        rate = weights
-    else:
-        rate = weights * np.array(counts, dtype=float)
-
+    muon rate of group w. Each entry already stores that rate as its 'weight'
+    field (importance weight * N), so alpha is just those weights normalized."""
+    rate = np.array([e["weight"] for e in models.values()], dtype=float)
     return rate / rate.sum()
 
 
@@ -120,9 +111,12 @@ if __name__ == "__main__":
         )
     print(f"Full-data fit complete in {time() - t0:.1f}s | avg_ll={train_ll:.6f}")
 
-    # ---- 4) save (flat format, directly usable by test_gmm.py) ----
+    # ---- 4) save (flat format, directly usable by test_gmm.py). The distilled
+    # GMM already is the full combined distribution, so its 'weight' is the total
+    # rate (sum of the per-group weight*N) it represents. ----
+    total_weight = float(sum(e["weight"] for e in models.values()))
     with open(args.out, "wb") as f:
-        pickle.dump({"gmm": gmm, "mean": mean, "std": std}, f)
+        pickle.dump({"gmm": gmm, "mean": mean, "std": std, "weight": total_weight}, f)
     print(f"Saved distilled GMM to {args.out}")
 
     # ---- 5) quick sanity plot of the distilled samples ----

@@ -235,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_samples", type=int, default=None, help="Max samples per weight group to load (None = all)")
     parser.add_argument("--components", type=int, nargs="+", default=[2,4,8,16,24], help="List of number of GMM components to try")
     parser.add_argument("--batch_size", type=int, default=5_000_000, help="Chunk size for streaming EM")
-    parser.add_argument("--select_samples", type=int, default=2_000_000, help="Subsample size used to pick the best K")
+    parser.add_argument("--select_samples", type=int, default=9_000_000, help="Subsample size used to pick the best K")
     parser.add_argument("--max_iter", type=int, default=100, help="Max EM iterations for the full-data fit")
     parser.add_argument("--tol", type=float, default=1e-4, help="Convergence tolerance on avg log-likelihood")
     parser.add_argument("--val_frac", type=float, default=0.2, help="Validation fraction for K selection")
@@ -282,7 +282,9 @@ if __name__ == "__main__":
             "gmm": gmm,
             "mean": mean,
             "std": std,
-            "n": n,             # sample count, needed to weight groups when combining
+            # Final mixing weight = importance weight * N. Sampling each group's GMM
+            # in proportion to this rebuilds the original full-data distribution.
+            "weight": float(weight) * n,
         }
 
     # save one model per weight group
