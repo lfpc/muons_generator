@@ -245,6 +245,8 @@ if __name__ == "__main__":
 
     models = {}
     for weight, arr in data.items():
+        if weight < 0.0001:                       # skip the spurious ~zero-weight group
+            continue
         n = arr.shape[0]
         print(f"\n========== Training GMM for weight {weight} (N={n}) ==========")
         pt = calc_pt(arr[:, 0], arr[:, 1])

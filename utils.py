@@ -54,7 +54,7 @@ def generate_pdg(num_samples):
     pdg_codes = (-13) * generate_charge(num_samples)
     return pdg_codes
 
-def generate_position(num_samples, SmearBeamRadius=5.0, sigma=1.6):
+def generate_position(num_samples, SmearBeamRadius=5.0, sigma=1.6, fixed_z=-1.9):
     #ring transformation
     gauss_x = np.random.normal(0, sigma, size=num_samples)
     gauss_y = np.random.normal(0, sigma, size=num_samples)
@@ -64,8 +64,8 @@ def generate_position(num_samples, SmearBeamRadius=5.0, sigma=1.6):
     y = SmearBeamRadius * np.sin(_phi) + gauss_y
     x = x / 100
     y = y / 100
-    #z = np.zeros(num_samples) 
-    return x, y#, z
+    z = np.full(num_samples, fixed_z)
+    return x, y, z
 
 
 def train_val_split(X, val_frac=0.2, seed=0):
