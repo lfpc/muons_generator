@@ -34,6 +34,28 @@ def get_real_muons_per_weight(file_path, num_samples=None):
             data[weight] = np.stack([px, py, pz, x_, y_, z_, pdg], axis=1)
     return data
 
+def get_real_muons_per_id(file_path, num_samples=None):
+    """Like get_real_muons_per_weight, but for full_sample_per_id.h5 (see
+    make_per_motherid.py): groups are keyed by motherID (int) instead of weight, and
+    each row also carries its own 'weight' column (not constant within a group, unlike
+    the per-weight split), so it's stacked in as an 8th column."""
+    print(f"Loading data from {file_path}...")
+    data = {}
+    with h5py.File(file_path, 'r') as f:
+        for group_name in f.keys():
+            group = f[group_name]
+            mother_id = int(group_name)
+            px = group['px'][:] if num_samples is None else group['px'][:num_samples]
+            py = group['py'][:] if num_samples is None else group['py'][:num_samples]
+            pz = group['pz'][:] if num_samples is None else group['pz'][:num_samples]
+            x_ = group['x'][:] if num_samples is None else group['x'][:num_samples]
+            y_ = group['y'][:] if num_samples is None else group['y'][:num_samples]
+            z_ = group['z'][:] if num_samples is None else group['z'][:num_samples]
+            pdg = group['pdg'][:] if num_samples is None else group['pdg'][:num_samples]
+            weight = group['weight'][:] if num_samples is None else group['weight'][:num_samples]
+            data[mother_id] = np.stack([px, py, pz, x_, y_, z_, pdg, weight], axis=1)
+    return data
+
 def calc_pt(px, py):
     return np.sqrt(px**2 + py**2)
 
@@ -85,6 +107,15 @@ def standardize_train_val(X_train, X_val):
     X_val_s = (X_val - mean) / std
     return X_train_s, X_val_s, mean, std
 
+def batch_sample(flow, n_samples, batch_size:int=5e6, **kwargs):
+    samples = []
+    batch_size = min(batch_size, n_samples)
+    for i in range(int(n_samples/batch_size)):
+        samples.append(flow.sample(batch_size, **kwargs).cpu().numpy())
+    if n_samples % batch_size > 0:
+        remainder = n_samples % batch_size
+        samples.append(flow.sample(remainder, **kwargs).cpu().numpy())
+    return np.concatenate(samples, axis=0)
 
 if __name__ == "__main__":
     file_path = '/home/hep/lprate/projects/MuonsAndMatter/data/muons/full_sample.h5'

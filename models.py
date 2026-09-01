@@ -294,13 +294,24 @@ class _SplineCoupling(nn.Module):
 class NeuralSplineFlow(nn.Module):
     """RQ-spline coupling flow over `dim`-D data with a standard-normal base."""
 
-    def __init__(self, dim=2, n_layers=6, hidden=(128, 128), num_bins=12, tail_bound=14.0):
+    def __init__(self, dim=2, n_layers=6, hidden=(128, 128), num_bins=12, tail_bound=14.0,
+                 log_transform=False, log_eps=None, log_dims=None):
         super().__init__()
         self.dim = dim
         self.n_layers = n_layers
         self.hidden = tuple(hidden)
         self.num_bins = num_bins
         self.tail_bound = float(tail_bound)
+        # log_transform: the data this flow was fit on is log(x) per dimension (with a
+        # per-dim epsilon shift, e.g. log(pt + eps) to keep values away from log(0)).
+        # When set, sample() undoes it (exp(x) - eps) so eval-mode sampling returns
+        # values on the original physical scale instead of the log-fit space.
+        self.log_transform = bool(log_transform)
+        self.log_eps = tuple(float(e) for e in log_eps) if log_eps is not None else tuple(0.0 for _ in range(dim))
+        # log_dims: which dimensions the log actually applies to (default: all of them).
+        # Lets a flow mix log-fitted dims (pz, pt) with raw ones (x, y, z, which are
+        # negative and so can't be logged) -- see train_flow_complete.py.
+        self.log_dims = tuple(bool(b) for b in log_dims) if log_dims is not None else tuple(True for _ in range(dim))
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             mask = (torch.arange(dim) % 2 == (i % 2))     # alternate which dims pass through
@@ -309,7 +320,9 @@ class NeuralSplineFlow(nn.Module):
     @property
     def config(self):
         return dict(dim=self.dim, n_layers=self.n_layers, hidden=list(self.hidden),
-                    num_bins=self.num_bins, tail_bound=self.tail_bound)
+                    num_bins=self.num_bins, tail_bound=self.tail_bound,
+                    log_transform=self.log_transform, log_eps=list(self.log_eps),
+                    log_dims=list(self.log_dims))
 
     @classmethod
     def from_config(cls, cfg):
@@ -329,10 +342,23 @@ class NeuralSplineFlow(nn.Module):
         return base + logdet
 
     @torch.no_grad()
-    def sample(self, n_samples, temperature=1.0):
+    def sample(self, n_samples, temperature=1.0, mean=None, std=None):
+        """Sample in the space the flow was fit on (standardized, log-transformed if
+        `log_transform`). If `mean`/`std` are given, samples are destandardized first.
+        In eval mode, if `log_transform` is set, the (destandardized) result is then
+        mapped back with exp(x) - log_eps on the `log_dims` dimensions, returning the
+        original physical scale."""
         p = next(self.parameters())
         z = torch.randn(int(n_samples), self.dim, device=p.device, dtype=p.dtype) * temperature
         for layer in reversed(self.layers):
             z = layer.inverse(z)
+        if mean is not None and std is not None:
+            mean = torch.as_tensor(mean, device=z.device, dtype=z.dtype).view(1, self.dim)
+            std = torch.as_tensor(std, device=z.device, dtype=z.dtype).view(1, self.dim)
+            z = z * std + mean
+        if self.log_transform and not self.training:
+            eps = torch.as_tensor(self.log_eps, device=z.device, dtype=z.dtype)
+            mask = torch.as_tensor(self.log_dims, device=z.device, dtype=torch.bool)
+            z = torch.where(mask, torch.exp(z) - eps, z)
         return z
 

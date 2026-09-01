@@ -57,6 +57,15 @@ def hist2d_density(xy, w=None):
     return H
 
 
+def hist2d_counts(xy, w=None):
+    """Unnormalized 2D pz-pt histogram (raw/weighted counts) on the shared grid. Used
+    to accumulate a density across many sampled chunks without ever holding all of them
+    in memory at once (see test_flow.py's --generated_weighted_sample); normalize the
+    accumulated total with grid_normalize() once done."""
+    H, _, _ = np.histogram2d(xy[:, 0], xy[:, 1], bins=[PZ_BINS, PT_BINS], weights=w)
+    return H
+
+
 def draw_hist2d(ax, H, norm, title=None):
     """Draw a precomputed density on the shared grid in log color scale."""
     im = ax.pcolormesh(PZ_BINS, PT_BINS, H.T, cmap='viridis', norm=norm)
@@ -120,6 +129,7 @@ def compare_marginals(ax_pz, ax_pt, real, gen, real_w=None, label=""):
                 histtype='step', color='k', label='real')
         ax.hist(gen[:, i], bins=bins, density=True,
                 histtype='step', color='C1', label='generated')
+        ax.set_yscale('log')
         ax.set_xlabel(name, fontsize=fontsize)
         ax.legend(fontsize=fontsize - 3)
         if label:
@@ -180,21 +190,38 @@ def report_saved_plots():
         print(f"  {p}")
 
 
-def plot_compare(real, gen, real_w, suptitle, fname, gen_density=None, gen_label=None, show=False):
-    """2x2 real-vs-generated panel: 2D densities (shared log scale + colorbar) on
-    top, pz/pt marginals below. The generated 2D panel shows gen_density if given
-    (a precomputed grid, analytic or sampled), else a histogram of the gen samples.
-    gen_label overrides the generated-panel title. The marginals and the returned
-    normalized W1 always come from the gen samples."""
+def plot_compare(real, gen, real_w, suptitle, fname, gen_density=None, gen_label=None,
+                 gen_weighted_density=None, gen_weighted_label=None, show=False):
+    """2x2 (2x3 if gen_weighted_density is given) real-vs-generated panel: 2D densities
+    (shared log scale + colorbar) on top, pz/pt marginals below. The generated 2D panel
+    shows gen_density if given (a precomputed grid, analytic or sampled), else a
+    histogram of the gen samples. gen_label overrides the generated-panel title.
+    gen_weighted_density, if given, adds a third top-row panel (with gen_weighted_label
+    as its title) -- typically the generated density resampled at the real data's
+    weighted count, so the two are compared at matched statistics. The real panel's
+    title reports real_w.sum() (the weighted/physical count) whenever real_w is given.
+    The marginals and the returned normalized W1 always come from the gen samples."""
     Hr = hist2d_density(real, real_w)
     Hg = gen_density if gen_density is not None else hist2d_density(gen)
-    norm = shared_lognorm(Hr, Hg)                     # same color scale for both
+    grids = [Hr, Hg] + ([gen_weighted_density] if gen_weighted_density is not None else [])
+    norm = shared_lognorm(*grids)                     # same color scale for every 2D panel
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
-    draw_hist2d(axes[0, 0], Hr, norm, title=f'real (N={real.shape[0]})')
+    ncols = 3 if gen_weighted_density is not None else 2
+    fig, axes = plt.subplots(2, ncols, figsize=(7 * ncols, 9), constrained_layout=True)
+
+    real_title = f'real (N={real.shape[0]})'
+    if real_w is not None:                             # real_w already weights the histogram
+        real_title += f', weighted N={real_w.sum():,.0f}'
+    draw_hist2d(axes[0, 0], Hr, norm, title=real_title)
+
     if gen_label is None:
         gen_label = 'generated (analytic PDF)' if gen_density is not None else f'generated (N={gen.shape[0]})'
     im = draw_hist2d(axes[0, 1], Hg, norm, title=gen_label)
+
+    if gen_weighted_density is not None:
+        draw_hist2d(axes[0, 2], gen_weighted_density, norm, title=gen_weighted_label)
+        axes[1, 2].axis('off')                         # no third marginal panel
+
     fig.colorbar(im, ax=axes[0, :].tolist(), label='density')
     w1 = compare_marginals(axes[1, 0], axes[1, 1], real, gen, real_w)
     if suptitle:

@@ -1,6 +1,7 @@
 outputs/
 __pycache__/
 *.pyc
+*.h5
 *.pyo
 .ipynb_checkpoints/
 *.egg-info/
