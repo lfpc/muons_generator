@@ -7,6 +7,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 
 import numpy as np
 from time import time
+from tqdm import tqdm
 import torch
 from utils import *
 from matplotlib import pyplot as plt
@@ -76,24 +77,30 @@ def fit_gmm_grid(X_train_s, X_val_s, n_components_list, random_state=0):
 # to a full-batch fit, but peak memory is O(batch_size * K) instead of O(N * K).
 # ----------------------------------------------------------------------------
 
-def _iter_batches(X, mean, std, batch_size):
-    """Yield standardized float64 chunks of X without copying the whole array."""
+def _iter_batches(X, w, mean, std, batch_size):
+    """Yield (standardized float64 chunk of X, matching weights) without copying the
+    whole array."""
     for start in range(0, X.shape[0], batch_size):
-        Xb = np.asarray(X[start:start + batch_size], dtype=np.float64)
-        yield (Xb - mean) / std
+        sl = slice(start, start + batch_size)
+        Xb = np.asarray(X[sl], dtype=np.float64)
+        yield (Xb - mean) / std, np.asarray(w[sl], dtype=np.float64)
 
 
-def _mean_std_batched(X, batch_size):
-    """Population mean/std over all of X in a single streaming pass."""
+def _mean_std_batched(X, w, batch_size):
+    """Weighted mean/std over all of X in a single streaming pass: the fit space has to
+    be standardized by the physical (rate-weighted) distribution, not the sampled one."""
     d = X.shape[1]
     s = np.zeros(d)
     ss = np.zeros(d)
-    n = 0
-    for start in range(0, X.shape[0], batch_size):
-        Xb = np.asarray(X[start:start + batch_size], dtype=np.float64)
-        s += Xb.sum(axis=0)
-        ss += (Xb * Xb).sum(axis=0)
-        n += Xb.shape[0]
+    n = 0.0
+    for start in tqdm(range(0, X.shape[0], batch_size), desc="mean/std", unit="chunk",
+                      leave=False, mininterval=2.0):
+        sl = slice(start, start + batch_size)
+        Xb = np.asarray(X[sl], dtype=np.float64)
+        wb = np.asarray(w[sl], dtype=np.float64)
+        s += np.einsum('ij,i->j', Xb, wb)
+        ss += np.einsum('ij,ij,i->j', Xb, Xb, wb)
+        n += wb.sum()
     mean = s / n
     var = np.maximum(ss / n - mean ** 2, 0.0)
     std = np.sqrt(var) + 1e-12
@@ -140,33 +147,43 @@ def _pack_gmm(weights, means, covs, reg_covar, n_iter, ll):
     return gmm
 
 
-def _init_from_subsample(X, mean, std, K, reg_covar, seed, max_subsample=1_000_000):
+def _init_from_subsample(X, w, mean, std, K, reg_covar, seed, max_subsample=1_000_000):
     """Initialize means/covs/weights by fitting sklearn on a standardized subsample."""
-    n = X.shape[0]
-    if n > max_subsample:
-        rng = np.random.default_rng(seed)
-        idx = np.sort(rng.choice(n, size=max_subsample, replace=False))
-        Xs = np.asarray(X[idx], dtype=np.float64)
-    else:
-        Xs = np.asarray(X, dtype=np.float64)
-    Xs = (Xs - mean) / std
+    Xs = (weighted_subsample(X, w, max_subsample, seed) - mean) / std
     g = GaussianMixture(n_components=K, covariance_type="full", reg_covar=reg_covar,
                         max_iter=100, n_init=1, init_params="kmeans", random_state=seed)
     g.fit(Xs)
     return g.weights_.copy(), g.means_.copy(), g.covariances_.copy()
 
 
-def fit_gmm_batched(X, mean, std, n_components, batch_size=5_000_000, init=None,
+def weighted_subsample(X, w, m, seed=0):
+    """m rows of X drawn with probability proportional to their weight, as float64.
+
+    sklearn's GaussianMixture.fit takes no sample_weight, so wherever it is used (the K
+    grid, the EM init) the weights are folded in by importance resampling instead --
+    the resampled rows are an unweighted draw from the same physical distribution."""
+    n = X.shape[0]
+    if n <= m:
+        return np.asarray(X, dtype=np.float64)
+    p = np.asarray(w, dtype=np.float64)
+    idx = np.sort(np.random.default_rng(seed).choice(n, size=m, replace=False,
+                                                     p=p / p.sum()))
+    return np.asarray(X[idx], dtype=np.float64)
+
+
+def fit_gmm_batched(X, w, mean, std, n_components, batch_size=5_000_000, init=None,
                     max_iter=100, tol=1e-4, reg_covar=1e-6, seed=0, verbose=True):
-    """Full-data GMM fit via streaming EM. X is standardized per-batch with mean/std.
+    """Full-data weighted GMM fit via streaming EM: every row's contribution to the
+    sufficient statistics is scaled by its importance weight, so the fit targets the
+    physical density. X is standardized per-batch with mean/std.
 
     Returns a sklearn GaussianMixture (params live in standardized space) and the
-    final average log-likelihood.
+    final weighted average log-likelihood.
     """
     d = X.shape[1]
     K = n_components
     if init is None:
-        weights, means, covs = _init_from_subsample(X, mean, std, K, reg_covar, seed)
+        weights, means, covs = _init_from_subsample(X, w, mean, std, K, reg_covar, seed)
     else:
         weights, means, covs = (np.array(init[0], dtype=np.float64),
                                 np.array(init[1], dtype=np.float64),
@@ -174,7 +191,8 @@ def fit_gmm_batched(X, mean, std, n_components, batch_size=5_000_000, init=None,
 
     lower_bound = -np.inf
     n_iter = 0
-    for it in range(1, max_iter + 1):
+    iters = tqdm(range(1, max_iter + 1), desc="EM", unit="iter", disable=not verbose)
+    for it in iters:
         n_iter = it
         Nk = np.zeros(K)
         Sx = np.zeros((K, d))
@@ -184,12 +202,15 @@ def fit_gmm_batched(X, mean, std, n_components, batch_size=5_000_000, init=None,
         log_w = np.log(weights)
 
         # ---- E-step + sufficient-statistic accumulation, streamed over chunks ----
-        for Xb in _iter_batches(X, mean, std, batch_size):
+        n_chunks = -(-X.shape[0] // batch_size)
+        for Xb, wb in tqdm(_iter_batches(X, w, mean, std, batch_size), total=n_chunks,
+                           desc=f"E-step {it}", unit="chunk", leave=False,
+                           mininterval=2.0):
             log_prob = _log_gaussian_full(Xb, means, covs) + log_w
             log_norm = logsumexp(log_prob, axis=1)
-            ll_sum += float(log_norm.sum())
-            total_n += Xb.shape[0]
-            resp = np.exp(log_prob - log_norm[:, None])         # (b, K)
+            ll_sum += float(wb @ log_norm)
+            total_n += float(wb.sum())
+            resp = np.exp(log_prob - log_norm[:, None]) * wb[:, None]   # (b, K)
             Nk += resp.sum(axis=0)
             for k in range(K):
                 rk = resp[:, k]
@@ -207,12 +228,15 @@ def fit_gmm_batched(X, mean, std, n_components, batch_size=5_000_000, init=None,
         avg_ll = ll_sum / total_n
         change = avg_ll - lower_bound
         if verbose:
-            print(f"    [batched EM] iter {it:3d} | avg_ll={avg_ll:.6f} | delta={change:.2e}")
+            iters.set_postfix(avg_ll=f"{avg_ll:.6f}", delta=f"{change:.2e}")
+            tqdm.write(f"    [batched EM] iter {it:3d} | avg_ll={avg_ll:.6f} | "
+                       f"delta={change:.2e}")
         lower_bound = avg_ll
         if abs(change) < tol:
             if verbose:
-                print(f"    [batched EM] converged at iter {it}")
+                tqdm.write(f"    [batched EM] converged at iter {it}")
             break
+    iters.close()
 
     return _pack_gmm(weights, means, covs, reg_covar, n_iter, lower_bound), lower_bound
 
@@ -231,8 +255,9 @@ def sample_gmm(gmm, mean, std, n_samples, seed=0):
 if __name__ == "__main__":
     import argparse
     import pickle
-    parser = argparse.ArgumentParser(description="Train GMM on muon data")
-    parser.add_argument("--num_samples", type=int, default=None, help="Max samples per weight group to load (None = all)")
+    parser = argparse.ArgumentParser(description="Train GMM on muon data",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--num_samples", type=int, default=None, help="Row cap on the data loaded (None = all)")
     parser.add_argument("--components", type=int, nargs="+", default=[2,4,8,16,24], help="List of number of GMM components to try")
     parser.add_argument("--batch_size", type=int, default=5_000_000, help="Chunk size for streaming EM")
     parser.add_argument("--select_samples", type=int, default=9_000_000, help="Subsample size used to pick the best K")
@@ -241,55 +266,37 @@ if __name__ == "__main__":
     parser.add_argument("--val_frac", type=float, default=0.2, help="Validation fraction for K selection")
     args = parser.parse_args()
 
-    data = get_real_muons_per_weight('/home/hep/lprate/projects/MuonsAndMatter/data/muons/full_sample_w.h5', num_samples=args.num_samples)
+    arr = get_real_muons(num_samples=args.num_samples, columns=('pz', 'px', 'py', 'weight'))
+    X = np.stack([arr[:, 0], calc_pt(arr[:, 1], arr[:, 2])], axis=1)      # [pz, pt]
+    w = arr[:, 3]
+    del arr
+    print(f"\n========== Training GMM on N={X.shape[0]:,} muons ==========")
 
-    models = {}
-    for weight, arr in data.items():
-        if weight < 0.0001:                       # skip the spurious ~zero-weight group
-            continue
-        n = arr.shape[0]
-        print(f"\n========== Training GMM for weight {weight} (N={n}) ==========")
-        pt = calc_pt(arr[:, 0], arr[:, 1])
-        X = np.stack([arr[:, 2], pt], axis=1)               # [pz, pt]
+    # standardization stats over all data, rate-weighted (single streaming pass)
+    mean, std = _mean_std_batched(X, w, args.batch_size)
 
-        # standardization stats over all data (single streaming pass)
-        mean, std = _mean_std_batched(X, args.batch_size)
+    # ---- 1) choose K on a weight-resampled subsample, via the in-memory sklearn grid ----
+    Xsub = (weighted_subsample(X, w, args.select_samples, seed=0) - mean) / std
+    X_train, X_val = train_val_split(Xsub, val_frac=args.val_frac, seed=0)
+    print(f"  Selecting K on {Xsub.shape[0]:,} samples...")
+    best, _ = fit_gmm_grid(X_train, X_val, n_components_list=args.components, random_state=0)
+    K = best["K"]
+    print(f"  Selected K={K} (val_ll={best['val_ll']:.6f}, BIC={best['bic']:.1f})")
 
-        # ---- 1) choose K on a subsample using the in-memory sklearn grid ----
-        m = min(n, args.select_samples)
-        if n > m:
-            rng = np.random.default_rng(0)
-            idx = np.sort(rng.choice(n, size=m, replace=False))
-            Xsub = np.asarray(X[idx], dtype=np.float64)
-        else:
-            Xsub = np.asarray(X, dtype=np.float64)
-        Xsub = (Xsub - mean) / std
-        X_train, X_val = train_val_split(Xsub, val_frac=args.val_frac, seed=0)
-        print(f"  Selecting K on {m} samples...")
-        best, _ = fit_gmm_grid(X_train, X_val, n_components_list=args.components, random_state=0)
-        K = best["K"]
-        print(f"  Selected K={K} (val_ll={best['val_ll']:.6f}, BIC={best['bic']:.1f})")
+    # ---- 2) final weighted fit on ALL data via streaming EM, warm-started from that K ----
+    t0 = time()
+    init = (best["model"].weights_, best["model"].means_, best["model"].covariances_)
+    gmm, train_ll = fit_gmm_batched(
+            X, w, mean, std, K,
+            batch_size=args.batch_size, init=init,
+            max_iter=args.max_iter, tol=args.tol, seed=0,
+        )
+    print(f"  Full-data fit complete in {time() - t0:.1f}s | avg_ll={train_ll:.6f}")
 
-        # ---- 2) final fit on ALL data via streaming EM, warm-started from the K pick ----
-        t0 = time()
-        init = (best["model"].weights_, best["model"].means_, best["model"].covariances_)
-        gmm, train_ll = fit_gmm_batched(
-                X, mean, std, K,
-                batch_size=args.batch_size, init=init,
-                max_iter=args.max_iter, tol=args.tol, seed=0,
-            )
-        print(f"  Full-data fit complete in {time() - t0:.1f}s | avg_ll={train_ll:.6f}")
+    # "weight" is the physical rate mass, as in the flow checkpoints
+    model = {"gmm": gmm, "mean": mean, "std": std,
+             "weight": float(w.sum(dtype=np.float64))}
 
-        models[weight] = {
-            "gmm": gmm,
-            "mean": mean,
-            "std": std,
-            # Final mixing weight = importance weight * N. Sampling each group's GMM
-            # in proportion to this rebuilds the original full-data distribution.
-            "weight": float(weight) * n,
-        }
-
-    # save one model per weight group
     with open("outputs/gmm_model.pkl", "wb") as f:
-        pickle.dump(models, f)
+        pickle.dump(model, f)
 

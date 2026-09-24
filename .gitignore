@@ -1,8 +1,32 @@
+# data
+*.h5
+*.hdf5
+*.root
+*.npz
+*.npy
+*.csv
+
+# models, histogram caches, results
 outputs/
+*.pt
+*.pth
+*.pkl
+
+# figures
+*.png
+*.pdf
+
+# logs
+*.log
+nohup.out
+
+# python / jupyter
 __pycache__/
 *.pyc
-*.h5
 *.pyo
-.ipynb_checkpoints/
 *.egg-info/
+.ipynb_checkpoints/
+
+# local environment and tool settings
 .env
+.claude/

@@ -1,60 +1,50 @@
+"""Data loading and small shared helpers.
+
+The muon file is a flat table: one dataset per column (px, py, pz, x, y, z, pdg,
+weight) and one row per muon, each row carrying its own importance weight. See
+input_files/unify_h5.py, which builds it.
+"""
+import os
+
 import torch
 import h5py
 import numpy as np
 
-def get_real_muons(file_path, num_samples=None):
-    print(f"Loading data from {file_path}...")
-    with h5py.File(file_path, 'r') as f:
-        px = f['px'][:] if num_samples is None else f['px'][:num_samples]
-        py = f['py'][:] if num_samples is None else f['py'][:num_samples]
-        pz = f['pz'][:] if num_samples is None else f['pz'][:num_samples]
-        x_ = f['x'][:] if num_samples is None else f['x'][:num_samples]
-        y_ = f['y'][:] if num_samples is None else f['y'][:num_samples]
-        z_ = f['z'][:] if num_samples is None else f['z'][:num_samples]
-        pdg = f['pdg'][:] if num_samples is None else f['pdg'][:num_samples]
-        weight = f['weight'][:] if num_samples is None else f['weight'][:num_samples]
-        data = np.stack([px, py, pz, x_, y_, z_, pdg, weight], axis=1)
-    return data
+COLS = ('px', 'py', 'pz', 'x', 'y', 'z', 'pdg', 'weight')
+DEFAULT_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)),'muons_data.h5')
+CHUNK = 5_000_000        # rows read from HDF5 at a time
 
-def get_real_muons_per_weight(file_path, num_samples=None):
-    print(f"Loading data from {file_path}...")
-    data = {}
-    with h5py.File(file_path, 'r') as f:
-        for group_name in f.keys():
-            print(f"Group: {group_name}")
-            group = f[group_name]
-            weight = group.attrs['weight']
-            px = group['px'][:] if num_samples is None else group['px'][:num_samples]
-            py = group['py'][:] if num_samples is None else group['py'][:num_samples]
-            pz = group['pz'][:] if num_samples is None else group['pz'][:num_samples]
-            x_ = group['x'][:] if num_samples is None else group['x'][:num_samples]
-            y_ = group['y'][:] if num_samples is None else group['y'][:num_samples]
-            z_ = group['z'][:] if num_samples is None else group['z'][:num_samples]
-            pdg = group['pdg'][:] if num_samples is None else group['pdg'][:num_samples]
-            data[weight] = np.stack([px, py, pz, x_, y_, z_, pdg], axis=1)
-    return data
 
-def get_real_muons_per_id(file_path, num_samples=None):
-    """Like get_real_muons_per_weight, but for full_sample_per_id.h5 (see
-    make_per_motherid.py): groups are keyed by motherID (int) instead of weight, and
-    each row also carries its own 'weight' column (not constant within a group, unlike
-    the per-weight split), so it's stacked in as an 8th column."""
-    print(f"Loading data from {file_path}...")
-    data = {}
+def get_real_muons(file_path=DEFAULT_DATA, num_samples=None, columns=COLS,
+                   rescale_weights=True):
+    """The muon table as one (N, len(columns)) float32 array, columns in `columns`
+    order -- (px, py, pz, x, y, z, pdg, weight) by default, i.e. the layout the rest of
+    the repo indexes positionally.
+
+    `num_samples` caps the rows read (from the head of the file, which is a
+    concatenation of statistically equivalent jobs, so the head is a fair sub-sample).
+    With `rescale_weights`, a capped read has its weights multiplied by N_total/n so the
+    sub-sample still carries the full physical rate; without it the weights are the
+    file's own. Reading is chunked straight into the output array -- a whole-column read
+    of 2.3e9 rows would be 9 GB of temporaries per column.
+    """
     with h5py.File(file_path, 'r') as f:
-        for group_name in f.keys():
-            group = f[group_name]
-            mother_id = int(group_name)
-            px = group['px'][:] if num_samples is None else group['px'][:num_samples]
-            py = group['py'][:] if num_samples is None else group['py'][:num_samples]
-            pz = group['pz'][:] if num_samples is None else group['pz'][:num_samples]
-            x_ = group['x'][:] if num_samples is None else group['x'][:num_samples]
-            y_ = group['y'][:] if num_samples is None else group['y'][:num_samples]
-            z_ = group['z'][:] if num_samples is None else group['z'][:num_samples]
-            pdg = group['pdg'][:] if num_samples is None else group['pdg'][:num_samples]
-            weight = group['weight'][:] if num_samples is None else group['weight'][:num_samples]
-            data[mother_id] = np.stack([px, py, pz, x_, y_, z_, pdg, weight], axis=1)
-    return data
+        n_total = f[columns[0]].shape[0]
+        n = n_total if not num_samples else min(num_samples, n_total)
+        out = np.empty((n, len(columns)), dtype=np.float32)
+        for i in range(0, n, CHUNK):
+            sl = slice(i, min(i + CHUNK, n))
+            for c, name in enumerate(columns):
+                out[sl, c] = f[name][sl]
+    msg = f"Loaded {n:,} of {n_total:,} muons from {file_path}"
+    if 'weight' in columns:
+        w = out[:, columns.index('weight')]
+        if rescale_weights and n < n_total:
+            w *= n_total / n
+        msg += f" (sum of weights {w.sum(dtype=np.float64):,.4g})"
+    print(msg)
+    return out
+
 
 def calc_pt(px, py):
     return np.sqrt(px**2 + py**2)
@@ -107,18 +97,5 @@ def standardize_train_val(X_train, X_val):
     X_val_s = (X_val - mean) / std
     return X_train_s, X_val_s, mean, std
 
-def batch_sample(flow, n_samples, batch_size:int=5e6, **kwargs):
-    samples = []
-    batch_size = min(batch_size, n_samples)
-    for i in range(int(n_samples/batch_size)):
-        samples.append(flow.sample(batch_size, **kwargs).cpu().numpy())
-    if n_samples % batch_size > 0:
-        remainder = n_samples % batch_size
-        samples.append(flow.sample(remainder, **kwargs).cpu().numpy())
-    return np.concatenate(samples, axis=0)
-
 if __name__ == "__main__":
-    file_path = '/home/hep/lprate/projects/MuonsAndMatter/data/muons/full_sample.h5'
-    data = get_real_muons(file_path)
-    print(data.shape)
-
+    print(get_real_muons(num_samples=1000).shape)

@@ -1,4 +1,7 @@
 import math
+import os
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -132,10 +135,15 @@ _MIN_BIN_HEIGHT = 1e-3
 _MIN_DERIVATIVE = 1e-3
 
 
-def _searchsorted(bin_locations, inputs, eps=1e-6):
-    bin_locations = bin_locations.clone()
-    bin_locations[..., -1] += eps
-    return torch.sum(inputs[..., None] >= bin_locations, dim=-1) - 1
+def _searchsorted(bin_locations, inputs):
+    """Index of the bin each input falls into.
+
+    A binary search, in place of the old sum(inputs[..., None] >= bin_locations) trick:
+    that materialized an (M, num_bins+1) boolean tensor plus a clone of the locations,
+    hundreds of MB per layer at a 1e6-row batch. Inputs exactly on the right edge come
+    back as num_bins and are clamped by the caller, as they were by the old eps."""
+    return torch.searchsorted(bin_locations.contiguous(),
+                              inputs[..., None].contiguous(), right=True).squeeze(-1) - 1
 
 
 def _rational_quadratic_spline(inputs, unnormalized_widths, unnormalized_heights,
@@ -209,12 +217,18 @@ def _rational_quadratic_spline(inputs, unnormalized_widths, unnormalized_heights
 
 def unconstrained_rational_quadratic_spline(inputs, unnormalized_widths, unnormalized_heights,
                                             unnormalized_derivatives, inverse=False, tail_bound=1.0):
-    """RQ spline inside [-B, B], identity (slope 1) linear tails outside."""
-    inside = (inputs >= -tail_bound) & (inputs <= tail_bound)
-    outside = ~inside
+    """RQ spline inside [-B, B], identity (slope 1) linear tails outside.
 
-    outputs = torch.zeros_like(inputs)
-    logabsdet = torch.zeros_like(inputs)
+    Branch-free on purpose. The natural way to write this -- run the spline on
+    inputs[inside] and scatter the result back -- costs a nonzero() for every boolean
+    mask and an `if inside.any()`, i.e. six device-to-host syncs per coupling layer, so
+    ~150 pipeline stalls per training step; that, not the arithmetic, was what made a
+    step take seconds. Here the spline is evaluated on every row (clamped into the
+    interval, which is exact for the rows that were inside anyway) and torch.where picks
+    spline or identity. The waste is the arithmetic on the out-of-range rows, which are
+    a fraction of a percent of a batch, and the clamp keeps their gradient on the
+    identity branch where it belongs."""
+    inside = (inputs >= -tail_bound) & (inputs <= tail_bound)
 
     # Pad derivatives so the boundary slope is exactly 1, matching the linear tails.
     unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
@@ -222,17 +236,15 @@ def unconstrained_rational_quadratic_spline(inputs, unnormalized_widths, unnorma
     unnormalized_derivatives[..., 0] = constant
     unnormalized_derivatives[..., -1] = constant
 
-    outputs[outside] = inputs[outside]
-    if inside.any():
-        out_in, logdet_in = _rational_quadratic_spline(
-            inputs=inputs[inside],
-            unnormalized_widths=unnormalized_widths[inside, :],
-            unnormalized_heights=unnormalized_heights[inside, :],
-            unnormalized_derivatives=unnormalized_derivatives[inside, :],
-            inverse=inverse,
-            left=-tail_bound, right=tail_bound, bottom=-tail_bound, top=tail_bound)
-        outputs[inside] = out_in
-        logabsdet[inside] = logdet_in
+    out_in, logdet_in = _rational_quadratic_spline(
+        inputs=inputs.clamp(-tail_bound, tail_bound),
+        unnormalized_widths=unnormalized_widths,
+        unnormalized_heights=unnormalized_heights,
+        unnormalized_derivatives=unnormalized_derivatives,
+        inverse=inverse,
+        left=-tail_bound, right=tail_bound, bottom=-tail_bound, top=tail_bound)
+    outputs = torch.where(inside, out_in, inputs)
+    logabsdet = torch.where(inside, logdet_in, torch.zeros_like(logdet_in))
     return outputs, logabsdet
 
 
@@ -256,6 +268,17 @@ class _SplineCoupling(nn.Module):
     def __init__(self, dim, mask, hidden, num_bins, tail_bound):
         super().__init__()
         self.register_buffer("mask", mask)
+        # Integer indices, not the boolean mask, for the split and the recombination:
+        # x[:, bool_mask] is advanced indexing, which runs a nonzero() -- and on CUDA a
+        # nonzero() is a device-to-host sync. Four of those per layer per direction is
+        # ~100 pipeline stalls a training step. index_select/index_copy_ with int64
+        # indices are plain gathers.
+        # persistent=False: they follow the module to the device but stay out of the
+        # state_dict, so checkpoints written before this change still load
+        self.register_buffer("id_idx", torch.nonzero(mask, as_tuple=True)[0],
+                             persistent=False)
+        self.register_buffer("tr_idx", torch.nonzero(~mask, as_tuple=True)[0],
+                             persistent=False)
         self.num_bins = num_bins
         self.tail_bound = float(tail_bound)
         self.id_dim = int(mask.sum().item())
@@ -270,48 +293,41 @@ class _SplineCoupling(nn.Module):
 
     def forward(self, x):                # data -> base; returns (z, logabsdet)
         n = x.shape[0]
-        id_part, tr_part = x[:, self.mask], x[:, ~self.mask]
+        id_part = x.index_select(1, self.id_idx)
+        tr_part = x.index_select(1, self.tr_idx)
         w, h, d = self._params(id_part, n)
         out, logabsdet = unconstrained_rational_quadratic_spline(
             tr_part, w, h, d, inverse=False, tail_bound=self.tail_bound)
         z = torch.empty_like(x)
-        z[:, self.mask] = id_part
-        z[:, ~self.mask] = out
+        z.index_copy_(1, self.id_idx, id_part)
+        z.index_copy_(1, self.tr_idx, out)
         return z, logabsdet.sum(-1)
 
     def inverse(self, z):                # base -> data
         n = z.shape[0]
-        id_part, tr_part = z[:, self.mask], z[:, ~self.mask]
+        id_part = z.index_select(1, self.id_idx)
+        tr_part = z.index_select(1, self.tr_idx)
         w, h, d = self._params(id_part, n)
         out, _ = unconstrained_rational_quadratic_spline(
             tr_part, w, h, d, inverse=True, tail_bound=self.tail_bound)
         x = torch.empty_like(z)
-        x[:, self.mask] = id_part
-        x[:, ~self.mask] = out
+        x.index_copy_(1, self.id_idx, id_part)
+        x.index_copy_(1, self.tr_idx, out)
         return x
 
 
 class NeuralSplineFlow(nn.Module):
-    """RQ-spline coupling flow over `dim`-D data with a standard-normal base."""
+    """RQ-spline coupling flow over `dim`-D data with a standard-normal base. It lives
+    entirely in its (standardized) fit space: mapping that space to and from physical
+    quantities is the job of the script that defines it."""
 
-    def __init__(self, dim=2, n_layers=6, hidden=(128, 128), num_bins=12, tail_bound=14.0,
-                 log_transform=False, log_eps=None, log_dims=None):
+    def __init__(self, dim=2, n_layers=6, hidden=(128, 128), num_bins=12, tail_bound=14.0):
         super().__init__()
         self.dim = dim
         self.n_layers = n_layers
         self.hidden = tuple(hidden)
         self.num_bins = num_bins
         self.tail_bound = float(tail_bound)
-        # log_transform: the data this flow was fit on is log(x) per dimension (with a
-        # per-dim epsilon shift, e.g. log(pt + eps) to keep values away from log(0)).
-        # When set, sample() undoes it (exp(x) - eps) so eval-mode sampling returns
-        # values on the original physical scale instead of the log-fit space.
-        self.log_transform = bool(log_transform)
-        self.log_eps = tuple(float(e) for e in log_eps) if log_eps is not None else tuple(0.0 for _ in range(dim))
-        # log_dims: which dimensions the log actually applies to (default: all of them).
-        # Lets a flow mix log-fitted dims (pz, pt) with raw ones (x, y, z, which are
-        # negative and so can't be logged) -- see train_flow_complete.py.
-        self.log_dims = tuple(bool(b) for b in log_dims) if log_dims is not None else tuple(True for _ in range(dim))
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             mask = (torch.arange(dim) % 2 == (i % 2))     # alternate which dims pass through
@@ -320,9 +336,7 @@ class NeuralSplineFlow(nn.Module):
     @property
     def config(self):
         return dict(dim=self.dim, n_layers=self.n_layers, hidden=list(self.hidden),
-                    num_bins=self.num_bins, tail_bound=self.tail_bound,
-                    log_transform=self.log_transform, log_eps=list(self.log_eps),
-                    log_dims=list(self.log_dims))
+                    num_bins=self.num_bins, tail_bound=self.tail_bound)
 
     @classmethod
     def from_config(cls, cfg):
@@ -343,11 +357,7 @@ class NeuralSplineFlow(nn.Module):
 
     @torch.no_grad()
     def sample(self, n_samples, temperature=1.0, mean=None, std=None):
-        """Sample in the space the flow was fit on (standardized, log-transformed if
-        `log_transform`). If `mean`/`std` are given, samples are destandardized first.
-        In eval mode, if `log_transform` is set, the (destandardized) result is then
-        mapped back with exp(x) - log_eps on the `log_dims` dimensions, returning the
-        original physical scale."""
+        """Samples in the fit space; destandardized if `mean`/`std` are given."""
         p = next(self.parameters())
         z = torch.randn(int(n_samples), self.dim, device=p.device, dtype=p.dtype) * temperature
         for layer in reversed(self.layers):
@@ -356,9 +366,40 @@ class NeuralSplineFlow(nn.Module):
             mean = torch.as_tensor(mean, device=z.device, dtype=z.dtype).view(1, self.dim)
             std = torch.as_tensor(std, device=z.device, dtype=z.dtype).view(1, self.dim)
             z = z * std + mean
-        if self.log_transform and not self.training:
-            eps = torch.as_tensor(self.log_eps, device=z.device, dtype=z.dtype)
-            mask = torch.as_tensor(self.log_dims, device=z.device, dtype=torch.bool)
-            z = torch.where(mask, torch.exp(z) - eps, z)
         return z
 
+
+# ---------------------------------------------------------------------------
+# Checkpoints: one flat dict -- the flow's config and weights, the mean/std that
+# standardize its fit space, and whatever the training script needs to map samples back
+# to physics (its `columns` name the fit space, plus that space's own parameters).
+#
+
+def save_flow(path, flow, state_dict, mean, std, **meta):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save({"config": flow.config,
+                "state_dict": {k: v.cpu() for k, v in state_dict.items()},
+                "mean": np.ravel(mean), "std": np.ravel(std), **meta}, path)
+
+
+def load_flow(path, device="cpu"):
+    """(flow in eval mode on `device`, checkpoint dict)."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    flow = NeuralSplineFlow.from_config(ckpt["config"])
+    flow.load_state_dict(ckpt["state_dict"])
+    return flow.to(device).eval(), ckpt
+
+
+@torch.no_grad()
+def sample_flow(flow, ckpt, n, convert=None, batch=1 << 21):
+    """n samples of a checkpointed flow as a float32 array, drawn `batch` at a time: in
+    its fit space (destandardized), or passed through `convert` batch by batch -- e.g. a
+    training script's to_physical -- so a large n never exists in float64 at once."""
+    out = None
+    for i in range(0, n, batch):
+        s = flow.sample(min(batch, n - i), mean=ckpt["mean"], std=ckpt["std"]).cpu().numpy()
+        s = convert(s) if convert is not None else s
+        if out is None:
+            out = np.empty((n, s.shape[1]), dtype=np.float32)
+        out[i:i + s.shape[0]] = s
+    return out
