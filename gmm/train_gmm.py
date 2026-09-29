@@ -1,301 +1,208 @@
+"""Fit the momentum GMM (gmm_model.py) by weighted EM on the GPU, on every row of the data.
+
+The fit space is the momentum flow's (u, v) (fit_space.py), standardized by its
+rate-weighted mean/std. EM uses every row with its own rate weight -- the exact weighted
+maximum likelihood fit -- starting from k-means on a weight-resampled subsample. The
+rows stay in host memory and are streamed to the GPU chunk by chunk (2.3e9 rows do not
+fit on the card).
+
+Run: python train_gmm.py --K 32
+"""
+import argparse
 import os
 import sys
-# utils.py / gen_eval.py live in the parent directory
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# Cap BLAS threads BEFORE importing numpy/sklearn: OpenBLAS was built for a
-# max of 128 threads and segfaults if more cores are available.
-for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
-           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-    os.environ.setdefault(_v, "64")
+import time
 
+import h5py
 import numpy as np
-from time import time
-from tqdm import tqdm
 import torch
-from utils import *
-from matplotlib import pyplot as plt
-from matplotlib.colors import LogNorm
-from sklearn.mixture import GaussianMixture
-from scipy.special import logsumexp
-from scipy.linalg import solve_triangular
+from tqdm import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import fit_space as fs
 from gmm_model import save_gmm
-
-figs_dir = 'outputs/figs/'
-show = False
-DEFAULT_SPLIT = os.path.join(os.path.dirname(DEFAULT_DATA), 'muons_data_split.h5')
+from utils import CHUNK, DEFAULT_DATA
 
 
-def fit_gmm_grid(X_train_s, X_val_s, n_components_list, random_state=0):
-    results = []
+class TorchGMM:
+    """Full-covariance mixture on a torch device: log_prob and sampling in batches."""
+    ELEMENTS = 1 << 27            # cap on rows * K * d per chunk (0.5 GB in float32)
 
-    for K in n_components_list:
-        print(f"Fitting GMM with K={K} components...")
-        t0 = time()
-        gmm = GaussianMixture(
-            n_components=K,
-            covariance_type="full",
-            reg_covar=1e-5,
-            max_iter=200,
-            n_init=3,
-            init_params="kmeans",
-            random_state=random_state,
-            verbose=0,
-        )
-        gmm.fit(X_train_s)
-        print(f"Fitting complete. Time taken: {time() - t0:.3f} seconds")
-        train_ll = gmm.score(X_train_s)   # average log-likelihood
-        val_ll = gmm.score(X_val_s)       # average log-likelihood
-        bic = gmm.bic(X_val_s)
-        aic = gmm.aic(X_val_s)
+    def __init__(self, weights, means, covs, device="cpu"):
+        self.weights = np.asarray(weights, dtype=np.float64) / np.sum(weights)
+        self.means_np = np.asarray(means, dtype=np.float64)
+        self.covs = np.asarray(covs, dtype=np.float64)
+        self.K, self.d = self.means_np.shape
+        self.to(device)
 
-        results.append({
-            "K": K,
-            "model": gmm,
-            "train_ll": train_ll,
-            "val_ll": val_ll,
-            "bic": bic,
-            "aic": aic,
-        })
+    def to(self, device):
+        eye, jitter = np.eye(self.d), 0.0
+        while True:                       # a nearly singular covariance gets a tiny jitter
+            try:
+                L = np.linalg.cholesky(self.covs + jitter * eye)
+                break
+            except np.linalg.LinAlgError:
+                jitter = max(1e-8, 10 * jitter)
+        self.covs = self.covs + jitter * eye
+        Linv = np.linalg.inv(L)
+        t = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
+        self.device = device
+        self.w, self.means, self.L = t(self.weights), t(self.means_np), t(L)
+        # L_k^-1 (x - mu_k) for every k at once: x @ W - b
+        self.W = t(np.concatenate(list(np.transpose(Linv, (0, 2, 1))), axis=1))    # (d, K d)
+        self.b = t(np.einsum("ked,kd->ke", Linv, self.means_np).ravel())
+        log_det = 2.0 * np.log(np.diagonal(L, axis1=1, axis2=2)).sum(axis=1)
+        self.log_norm = t(np.log(self.weights) - 0.5 * (self.d * np.log(2 * np.pi) + log_det))
+        return self
 
-        print(
-            f"K={K:2d} | train_ll={train_ll:.6f} | "
-            f"val_ll={val_ll:.6f} | BIC={bic:.1f} | AIC={aic:.1f}"
-        )
+    @property
+    def n_params(self):
+        return self.K - 1 + self.K * self.d + self.K * self.d * (self.d + 1) // 2
 
-    def pick_best_simple(results, delta=0.01):
-        best_val_ll = max(d["val_ll"] for d in results)
-        candidates = [d for d in results if d["val_ll"] >= best_val_ll - delta]
-        return min(candidates, key=lambda d: d["K"])
-    best = max(results, key=lambda d: d["val_ll"])
-    return best, results
+    def chunks(self, n):
+        step = max(1024, self.ELEMENTS // (self.K * self.d))
+        return range(0, n, step), step
 
+    def component_log_prob(self, x):
+        """log pi_k N(x | mu_k, cov_k), (n, K)."""
+        sol = (x @ self.W - self.b).view(x.shape[0], self.K, self.d)
+        return self.log_norm - 0.5 * sol.pow(2).sum(-1)
 
-# ----------------------------------------------------------------------------
-# Memory-efficient (streaming) GMM training.
-#
-# EM for a GMM only needs, per component k, the summed sufficient statistics
-#   N_k   = sum_n r_nk
-#   Sx_k  = sum_n r_nk x_n
-#   Sxx_k = sum_n r_nk x_n x_n^T
-# The E-step is independent per sample, so we can stream the data in chunks,
-# accumulate these sums, and do the M-step from them. The result is identical
-# to a full-batch fit, but peak memory is O(batch_size * K) instead of O(N * K).
-# ----------------------------------------------------------------------------
+    @torch.no_grad()
+    def log_prob(self, x):
+        starts, step = self.chunks(x.shape[0])
+        return torch.cat([torch.logsumexp(self.component_log_prob(x[i:i + step]), 1) for i in starts])
 
-def _iter_batches(X, w, mean, std, batch_size):
-    """Yield (standardized float64 chunk of X, matching weights) without copying the
-    whole array."""
-    for start in range(0, X.shape[0], batch_size):
-        sl = slice(start, start + batch_size)
-        Xb = np.asarray(X[sl], dtype=np.float64)
-        yield (Xb - mean) / std, np.asarray(w[sl], dtype=np.float64)
+    @torch.no_grad()
+    def sample(self, n, mean, std):
+        comp = torch.distributions.Categorical(probs=self.w).sample((n,))
+        eps = torch.randn(n, self.d, device=self.device)
+        return (self.means[comp] + torch.einsum("nij,nj->ni", self.L[comp], eps)) * std + mean
 
 
-def _mean_std_batched(X, w, batch_size):
-    """Weighted mean/std over all of X in a single streaming pass: the fit space has to
-    be standardized by the physical (rate-weighted) distribution, not the sampled one."""
-    d = X.shape[1]
-    s = np.zeros(d)
-    ss = np.zeros(d)
-    n = 0.0
-    for start in tqdm(range(0, X.shape[0], batch_size), desc="mean/std", unit="chunk",
-                      leave=False, mininterval=2.0):
-        sl = slice(start, start + batch_size)
-        Xb = np.asarray(X[sl], dtype=np.float64)
-        wb = np.asarray(w[sl], dtype=np.float64)
-        s += np.einsum('ij,i->j', Xb, wb)
-        ss += np.einsum('ij,ij,i->j', Xb, Xb, wb)
-        n += wb.sum()
-    mean = s / n
-    var = np.maximum(ss / n - mean ** 2, 0.0)
-    std = np.sqrt(var) + 1e-12
-    return mean.reshape(1, -1), std.reshape(1, -1)
-
-
-def _log_gaussian_full(X, means, covs):
-    """Per-component log N(x | mean_k, cov_k) for full covariances. (n, K)."""
+def kmeans_init(X, K, reg, iters=25, seed=0):
+    """k-means++ then Lloyd on an (unweighted, already weight-resampled) subsample;
+    returns (weights, means, covariances) of the clusters."""
+    g = torch.Generator(device=X.device).manual_seed(seed)
     n, d = X.shape
-    K = means.shape[0]
-    out = np.empty((n, K))
-    half_log_2pi = 0.5 * d * np.log(2.0 * np.pi)
-    for k in range(K):
-        L = np.linalg.cholesky(covs[k])
-        diff = (X - means[k]).T                         # (d, n)
-        sol = solve_triangular(L, diff, lower=True)     # (d, n)
-        maha = np.einsum('dn,dn->n', sol, sol)
-        log_det = 2.0 * np.sum(np.log(np.diag(L)))
-        out[:, k] = -(half_log_2pi + 0.5 * log_det + 0.5 * maha)
-    return out
+    C = X[torch.randint(n, (1,), generator=g, device=X.device)]
+    d2 = (X - C[0]).pow(2).sum(1)
+    for _ in range(1, K):
+        idx = torch.multinomial(d2 / d2.sum(), 1, generator=g)
+        C = torch.cat([C, X[idx]])
+        d2 = torch.minimum(d2, (X - X[idx]).pow(2).sum(1))
+    for _ in range(iters):
+        lab = torch.cat([torch.cdist(X[i:i + (1 << 16)], C).argmin(1) for i in range(0, n, 1 << 16)])
+        cnt = torch.bincount(lab, minlength=K).double()
+        S = torch.zeros(K, d, dtype=torch.float64, device=X.device).index_add_(0, lab, X.double())
+        C[cnt > 0] = (S[cnt > 0] / cnt[cnt > 0, None]).float()
+    Xd, cnt = X.double(), torch.bincount(lab, minlength=K).double().clamp_min(1.0)
+    mu = torch.zeros(K, d, dtype=torch.float64, device=X.device).index_add_(0, lab, Xd) / cnt[:, None]
+    diff = Xd - mu[lab]
+    cov = torch.zeros(K, d * d, dtype=torch.float64, device=X.device).index_add_(
+        0, lab, (diff[:, :, None] * diff[:, None, :]).flatten(1)).view(K, d, d) / cnt[:, None, None]
+    cov += reg * torch.eye(d, dtype=torch.float64, device=X.device)
+    cov[torch.bincount(lab, minlength=K) < 2 * d] = torch.cov(Xd.T) / K ** (2.0 / d)
+    return (cnt / cnt.sum()).cpu().numpy(), mu.cpu().numpy(), cov.cpu().numpy()
 
 
-def _precisions_cholesky_full(covs):
-    """Cholesky of the precisions, matching sklearn's GaussianMixture attribute."""
-    K, d, _ = covs.shape
-    prec_chol = np.empty_like(covs)
-    for k in range(K):
-        L = np.linalg.cholesky(covs[k])
-        prec_chol[k] = solve_triangular(L, np.eye(d), lower=True).T
-    return prec_chol
-
-
-def _pack_gmm(weights, means, covs, reg_covar, n_iter, ll):
-    """Wrap fitted params into a sklearn GaussianMixture so .sample()/.score() work."""
-    K, d = means.shape
-    gmm = GaussianMixture(n_components=K, covariance_type="full", reg_covar=reg_covar)
-    gmm.weights_ = weights
-    gmm.means_ = means
-    gmm.covariances_ = covs
-    gmm.precisions_cholesky_ = _precisions_cholesky_full(covs)
-    gmm.converged_ = True
-    gmm.n_iter_ = n_iter
-    gmm.lower_bound_ = ll
+def fit_gmm(X, w, K, device, reg_covar=1e-5, max_iter=500, tol=1e-5, seed=0):
+    """Weighted EM over all rows of X (standardized float32 tensor, on `device` or on the
+    CPU, streamed chunk by chunk). Sums in float64, TF32 off."""
+    torch.backends.cuda.matmul.allow_tf32 = False
+    wn = w.cpu().numpy().astype(np.float64)
+    idx = np.random.default_rng(seed).choice(len(wn), size=min(1_000_000, len(wn)), p=wn / wn.sum())
+    del wn
+    gmm = TorchGMM(*kmeans_init(X[torch.from_numpy(idx).to(X.device)].to(device), K, reg_covar,
+                                seed=seed), device)
+    d, wsum, prev = X.shape[1], w.sum(dtype=torch.float64).item(), -np.inf
+    starts, step = gmm.chunks(X.shape[0])
+    bar = tqdm(range(max_iter), desc=f"EM K={K}", mininterval=2.0)
+    for it in bar:
+        Nk = torch.zeros(K, dtype=torch.float64, device=device)
+        Sx = torch.zeros(K, d, dtype=torch.float64, device=device)
+        Sxx = torch.zeros(K, d * d, dtype=torch.float64, device=device)
+        ll = 0.0
+        for i in starts:
+            xb, wb = X[i:i + step].to(device), w[i:i + step].to(device)
+            lp = gmm.component_log_prob(xb)
+            lse = torch.logsumexp(lp, 1)
+            ll += (wb.double() * lse.double()).sum().item()
+            resp = torch.exp(lp - lse[:, None]) * wb[:, None]
+            Nk += resp.sum(0).double()
+            Sx += (resp.T @ xb).double()
+            Sxx += (resp.T @ (xb[:, :, None] * xb[:, None, :]).flatten(1)).double()
+        ll /= wsum
+        Nk, Sx, Sxx = (a.cpu().numpy() for a in (Nk, Sx, Sxx))
+        alive = Nk > 1e-12 * wsum                  # an emptied component keeps its last state
+        mu = np.where(alive[:, None], Sx / np.maximum(Nk, 1e-300)[:, None], gmm.means_np)
+        cov = Sxx.reshape(K, d, d) / np.maximum(Nk, 1e-300)[:, None, None] - mu[:, :, None] * mu[:, None, :]
+        cov = np.where(alive[:, None, None], 0.5 * (cov + cov.transpose(0, 2, 1)) + reg_covar * np.eye(d), gmm.covs)
+        gmm = TorchGMM(np.where(alive, Nk, 0.0) + 1e-300, mu, cov, device)
+        bar.set_postfix(ll=f"{ll:.6f}", refresh=False)
+        if ll - prev < tol:
+            break
+        prev = ll
+    bar.close()
+    print(f"  EM K={K}: {it + 1} iterations, weighted mean log-likelihood {ll:.5f} (fit space)")
     return gmm
 
 
-def _init_from_subsample(X, w, mean, std, K, reg_covar, seed, max_subsample=1_000_000):
-    """Initialize means/covs/weights by fitting sklearn on a standardized subsample."""
-    Xs = (weighted_subsample(X, w, max_subsample, seed) - mean) / std
-    g = GaussianMixture(n_components=K, covariance_type="full", reg_covar=reg_covar,
-                        max_iter=100, n_init=1, init_params="kmeans", random_state=seed)
-    g.fit(Xs)
-    return g.weights_.copy(), g.means_.copy(), g.covariances_.copy()
+def read_momentum(path, group, num_samples, p_max):
+    """[u, v, log_jac, weight] float32 of the rows of `path` (or one group of it), and
+    p_min = 0.9 x the smallest |p|: two streamed passes."""
+    with h5py.File(path, "r") as f:
+        g = f[group] if group else f
+        n = min(num_samples or g["pz"].shape[0], g["pz"].shape[0])
+        p_lo = np.inf
+        for i in tqdm(range(0, n, CHUNK), desc="p_min", mininterval=2.0):
+            sl = slice(i, min(i + CHUNK, n))
+            p_lo = min(p_lo, np.sqrt(sum(g[c][sl].astype(np.float64) ** 2 for c in ("px", "py", "pz"))).min())
+        m = {"p_min": 0.9 * p_lo, "p_max": p_max}
+        T = np.empty((n, 4), dtype=np.float32)
+        for i in tqdm(range(0, n, CHUNK), desc="reading", mininterval=2.0):
+            sl = slice(i, min(i + CHUNK, n))
+            px, py, pz, w = (g[c][sl].astype(np.float64) for c in ("px", "py", "pz", "weight"))
+            T[sl, :2], T[sl, 2] = fs.momentum_to_fit(pz, np.hypot(px, py), m)
+            T[sl, 3] = w
+    return T, m
 
 
-def weighted_subsample(X, w, m, seed=0):
-    """m rows of X drawn with probability proportional to their weight, as float64.
-
-    sklearn's GaussianMixture.fit takes no sample_weight, so wherever it is used (the K
-    grid, the EM init) the weights are folded in by importance resampling instead --
-    the resampled rows are an unweighted draw from the same physical distribution."""
-    n = X.shape[0]
-    if n <= m:
-        return np.asarray(X, dtype=np.float64)
-    p = np.asarray(w, dtype=np.float64)
-    idx = np.sort(np.random.default_rng(seed).choice(n, size=m, replace=False,
-                                                     p=p / p.sum()))
-    return np.asarray(X[idx], dtype=np.float64)
-
-
-def fit_gmm_batched(X, w, mean, std, n_components, batch_size=5_000_000, init=None,
-                    max_iter=100, tol=1e-4, reg_covar=1e-6, seed=0, verbose=True):
-    """Full-data weighted GMM fit via streaming EM: every row's contribution to the
-    sufficient statistics is scaled by its importance weight, so the fit targets the
-    physical density. X is standardized per-batch with mean/std.
-
-    Returns a sklearn GaussianMixture (params live in standardized space) and the
-    final weighted average log-likelihood.
-    """
-    d = X.shape[1]
-    K = n_components
-    if init is None:
-        weights, means, covs = _init_from_subsample(X, w, mean, std, K, reg_covar, seed)
-    else:
-        weights, means, covs = (np.array(init[0], dtype=np.float64),
-                                np.array(init[1], dtype=np.float64),
-                                np.array(init[2], dtype=np.float64))
-
-    lower_bound = -np.inf
-    n_iter = 0
-    iters = tqdm(range(1, max_iter + 1), desc="EM", unit="iter", disable=not verbose)
-    for it in iters:
-        n_iter = it
-        Nk = np.zeros(K)
-        Sx = np.zeros((K, d))
-        Sxx = np.zeros((K, d, d))
-        ll_sum = 0.0
-        total_n = 0
-        log_w = np.log(weights)
-
-        # ---- E-step + sufficient-statistic accumulation, streamed over chunks ----
-        n_chunks = -(-X.shape[0] // batch_size)
-        for Xb, wb in tqdm(_iter_batches(X, w, mean, std, batch_size), total=n_chunks,
-                           desc=f"E-step {it}", unit="chunk", leave=False,
-                           mininterval=2.0):
-            log_prob = _log_gaussian_full(Xb, means, covs) + log_w
-            log_norm = logsumexp(log_prob, axis=1)
-            ll_sum += float(wb @ log_norm)
-            total_n += float(wb.sum())
-            resp = np.exp(log_prob - log_norm[:, None]) * wb[:, None]   # (b, K)
-            Nk += resp.sum(axis=0)
-            for k in range(K):
-                rk = resp[:, k]
-                Sx[k] += rk @ Xb
-                Sxx[k] += (Xb * rk[:, None]).T @ Xb
-
-        # ---- M-step from accumulated statistics ----
-        Nk_safe = np.maximum(Nk, 1e-12)
-        weights = Nk / total_n
-        means = Sx / Nk_safe[:, None]
-        for k in range(K):
-            covs[k] = Sxx[k] / Nk_safe[k] - np.outer(means[k], means[k])
-            covs[k].flat[::d + 1] += reg_covar              # add reg to diagonal
-
-        avg_ll = ll_sum / total_n
-        change = avg_ll - lower_bound
-        if verbose:
-            iters.set_postfix(avg_ll=f"{avg_ll:.6f}", delta=f"{change:.2e}")
-            tqdm.write(f"    [batched EM] iter {it:3d} | avg_ll={avg_ll:.6f} | "
-                       f"delta={change:.2e}")
-        lower_bound = avg_ll
-        if abs(change) < tol:
-            if verbose:
-                tqdm.write(f"    [batched EM] converged at iter {it}")
-            break
-    iters.close()
-
-    return _pack_gmm(weights, means, covs, reg_covar, n_iter, lower_bound), lower_bound
+class ArgFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    pass
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Train GMM on muon data",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--data", type=str, default=DEFAULT_SPLIT, help="Split muon file (split_by_weight.py output)")
-    parser.add_argument("--group", type=str, default="above_W", help="Group of --data to train on; the rest of the file is ignored")
-    parser.add_argument("--num_samples", type=int, default=None, help="Row cap on the data loaded (None = all)")
-    parser.add_argument("--components", type=int, nargs="+", default=[2,4,8,16,24], help="List of number of GMM components to try")
-    parser.add_argument("--batch_size", type=int, default=5_000_000, help="Chunk size for streaming EM")
-    parser.add_argument("--select_samples", type=int, default=9_000_000, help="Subsample size used to pick the best K")
-    parser.add_argument("--max_iter", type=int, default=100, help="Max EM iterations for the full-data fit")
-    parser.add_argument("--tol", type=float, default=1e-4, help="Convergence tolerance on avg log-likelihood")
-    parser.add_argument("--val_frac", type=float, default=0.2, help="Validation fraction for K selection")
-    parser.add_argument("--out", type=str, default="outputs/gmm_model.json", help="Output model file (JSON, see gmm_model.py)")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=ArgFormatter)
+    parser.add_argument("--data", default=DEFAULT_DATA, help="Muon file (the pooled table: every row)")
+    parser.add_argument("--group", default=None, help="Group of a split --data to read (None = the file root)")
+    parser.add_argument("--num_samples", type=int, default=None, help="Row cap (None = all)")
+    parser.add_argument("--K", type=int, default=32, help="Number of components")
+    parser.add_argument("--p_max", type=float, default=fs.P_MAX, help="Upper bound on |p| [GeV]")
+    parser.add_argument("--reg_covar", type=float, default=1e-5, help="Added to every covariance diagonal")
+    parser.add_argument("--max_iter", type=int, default=500, help="EM iteration cap")
+    parser.add_argument("--tol", type=float, default=1e-5, help="Stop when the mean log-likelihood gains less")
+    parser.add_argument("--device", default="cuda", help="EM device")
+    parser.add_argument("--out", default="outputs/gmm_model.json", help="Output JSON")
     args = parser.parse_args()
 
-    arr = get_real_muons(args.data, num_samples=args.num_samples,
-                         columns=('pz', 'px', 'py', 'weight'), group=args.group)
-    # fit space is (log pz, log pt): both are strictly positive in the data
-    X = np.stack([np.log(arr[:, 0]), np.log(calc_pt(arr[:, 1], arr[:, 2]))], axis=1)
-    w = arr[:, 3]
-    del arr
-    assert np.isfinite(X).all(), "non-positive pz or pt: log is undefined"
-    print(f"\n========== Training GMM on N={X.shape[0]:,} muons ({args.group}) ==========")
+    t0 = time.time()
+    T, m = read_momentum(args.data, args.group, args.num_samples, args.p_max)
+    w = T[:, 3].astype(np.float64)
+    mean = (w @ T[:, :2].astype(np.float64)) / w.sum()
+    std = np.sqrt((w @ T[:, :2].astype(np.float64) ** 2) / w.sum() - mean ** 2)
+    print(f"Loaded {len(T):,} muons in {time.time() - t0:.0f}s, p_min {m['p_min']:.4g} GeV")
 
-    # standardization stats over all data, rate-weighted (single streaming pass)
-    mean, std = _mean_std_batched(X, w, args.batch_size)
+    X = torch.from_numpy((T[:, :2] - mean.astype(np.float32)) / std.astype(np.float32))
+    gmm = fit_gmm(X, torch.from_numpy(np.ascontiguousarray(T[:, 3])), args.K, args.device,
+                  args.reg_covar, args.max_iter, args.tol)
 
-    # ---- 1) choose K on a weight-resampled subsample, via the in-memory sklearn grid ----
-    Xsub = (weighted_subsample(X, w, args.select_samples, seed=0) - mean) / std
-    X_train, X_val = train_val_split(Xsub, val_frac=args.val_frac, seed=0)
-    print(f"  Selecting K on {Xsub.shape[0]:,} samples...")
-    best, _ = fit_gmm_grid(X_train, X_val, n_components_list=args.components, random_state=0)
-    K = best["K"]
-    print(f"  Selected K={K} (val_ll={best['val_ll']:.6f}, BIC={best['bic']:.1f})")
+    tot = 0.0                                  # rate-weighted NLL of (pz, pt) [GeV^-2]
+    for i in range(0, len(X), 1 << 22):
+        lp = gmm.log_prob(X[i:i + (1 << 22)].to(args.device)).double().cpu().numpy()
+        tot += float(w[i:i + (1 << 22)] @ (lp - np.log(std).sum() + T[i:i + (1 << 22), 2]))
+    print(f"Rate-weighted NLL of (pz, pt) over the training rows: {-tot / w.sum():.5f} nats/muon")
 
-    # ---- 2) final weighted fit on ALL data via streaming EM, warm-started from that K ----
-    t0 = time()
-    init = (best["model"].weights_, best["model"].means_, best["model"].covariances_)
-    gmm, train_ll = fit_gmm_batched(
-            X, w, mean, std, K,
-            batch_size=args.batch_size, init=init,
-            max_iter=args.max_iter, tol=args.tol, seed=0,
-        )
-    print(f"  Full-data fit complete in {time() - t0:.1f}s | avg_ll={train_ll:.6f}")
-
-    # "weight" is the physical rate mass (of --group only), as in the flow checkpoints.
-    # mean/std and the GMM params are in (log pz, log pt) space.
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    save_gmm(args.out, gmm.weights_, gmm.means_, gmm.covariances_, mean, std,
-             weight=float(w.sum(dtype=np.float64)), space="log", group=args.group)
+    save_gmm(args.out, gmm.weights, gmm.means_np, gmm.covs, mean, std, **m)
     print(f"Saved {args.out}")
-

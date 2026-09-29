@@ -1,65 +1,38 @@
-"""Portable GMM: save/load as JSON, sample and evaluate with numpy (or torch) only.
+"""A Gaussian mixture for the muon momentum, as a numpy-only baseline to the momentum
+flow: load from JSON, sample and evaluate without scikit-learn or torch.
 
-The model lives in a standardized fit space x_s = (f(pz, pt) - mean) / std, where f is
-  - (log pz, log pt) (train_gmm.py; files without a "columns" entry), or
-  - (u, v) = (logit((|p| - p_min) / (p_max - p_min)), log(pt / pz)), the bounded momentum
-    space of train_flow_ploss.py (columns ["logit_p", "log_tan_theta"], with p_min and
-    p_max stored alongside; train_gmm_momentum.py), where every sample has
-    p_min < |p| < p_max and pz, pt > 0 by construction.
-The file holds just what defines it: mixture weights, means, covariances and the
-standardization mean/std (plus metadata such as the physical rate "weight" and the
-training "group"). Everything else (Cholesky factors, precisions) is derived on load.
+It lives in the momentum flow's space (fit_space.py): (u, v), standardized by the stored
+mean/std, so every sample has p_min < |p| < p_max and pz, pt > 0. The JSON holds the
+mixture (weights, means, covariances), mean, std and p_min, p_max; train_gmm.py writes it.
 """
 import json
+import os
+import sys
 
 import numpy as np
 
-_ARRAYS = ("weights", "means", "covariances", "mean", "std")
-LOGIT_COLUMNS = ["logit_p", "log_tan_theta"]
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from fit_space import fit_to_momentum, momentum_to_fit
 
 
-def logit_space(pz, pt, p_min, p_max):
-    """(pz, pt) -> (u, v), and log |d(u, v) / d(pz, pt)|."""
-    p = np.hypot(pz, pt)
-    uv = np.column_stack([np.log(p - p_min) - np.log(p_max - p), np.log(pt / pz)])
-    log_jac = (np.log(p_max - p_min) - np.log(p - p_min) - np.log(p_max - p)
-               + np.log(p) - np.log(pz) - np.log(pt))
-    return uv, log_jac
-
-
-def logit_inverse(uv, p_min, p_max):
-    """(u, v) -> (pz, pt)."""
-    p = p_min + (p_max - p_min) / (1.0 + np.exp(-uv[:, 0]))
-    pz = p / np.sqrt(1.0 + np.exp(2.0 * uv[:, 1]))
-    return pz, pz * np.exp(uv[:, 1])
-
-
-def save_gmm(path, weights, means, covariances, mean, std, **meta):
-    """Write the GMM to `path` as JSON. Floats round-trip exactly (repr)."""
+def save_gmm(path, weights, means, covariances, mean, std, p_min, p_max):
     arrays = dict(weights=weights, means=means, covariances=covariances, mean=mean, std=std)
     out = {k: np.asarray(v, dtype=np.float64).tolist() for k, v in arrays.items()}
-    out.update(meta)
     with open(path, "w") as f:
-        json.dump(out, f, indent=1)
+        json.dump({**out, "p_min": float(p_min), "p_max": float(p_max)}, f, indent=1)
 
 
 class GMM:
-    """Full-covariance Gaussian mixture in a standardized (pz, pt) fit space."""
-
-    def __init__(self, weights, means, covariances, mean, std, **meta):
-        self.weights = np.asarray(weights, dtype=np.float64)
-        self.weights = self.weights / self.weights.sum()
-        self.means = np.asarray(means, dtype=np.float64)                  # (K, d)
-        self.covariances = np.asarray(covariances, dtype=np.float64)      # (K, d, d)
-        self.mean = np.asarray(mean, dtype=np.float64).ravel()            # (d,)
-        self.std = np.asarray(std, dtype=np.float64).ravel()              # (d,)
-        self.meta = meta
-        self.logit = meta.get("columns") == LOGIT_COLUMNS
-        self.chol = np.linalg.cholesky(self.covariances)                  # (K, d, d), cov = L L^T
-        self.chol_inv = np.linalg.inv(self.chol)                          # L^-1
-        d = self.means.shape[1]
+    def __init__(self, weights, means, covariances, mean, std, p_min, p_max, **_):
+        self.weights = np.asarray(weights) / np.sum(weights)
+        self.means = np.asarray(means, dtype=np.float64)                  # (K, 2)
+        self.covariances = np.asarray(covariances, dtype=np.float64)      # (K, 2, 2)
+        self.mean, self.std = np.ravel(mean), np.ravel(std)
+        self.bounds = {"p_min": p_min, "p_max": p_max}
+        self.chol = np.linalg.cholesky(self.covariances)                  # cov = L L^T
+        self.chol_inv = np.linalg.inv(self.chol)
         log_det = 2.0 * np.log(np.diagonal(self.chol, axis1=1, axis2=2)).sum(axis=1)
-        self._log_norm = np.log(self.weights) - 0.5 * (d * np.log(2.0 * np.pi) + log_det)
+        self._log_norm = np.log(self.weights) - 0.5 * (2 * np.log(2.0 * np.pi) + log_det)
 
     @classmethod
     def load(cls, path):
@@ -68,77 +41,24 @@ class GMM:
 
     @property
     def n_components(self):
-        return self.weights.shape[0]
+        return len(self.weights)
 
-    # ---- standardized space ---- #
-    def component_log_prob(self, Xs):
-        """log(pi_k N(x_s | mu_k, cov_k)) per component, (n, K)."""
-        Xs = np.asarray(Xs, dtype=np.float64)
-        out = np.empty((Xs.shape[0], self.n_components))
-        for k in range(self.n_components):
-            sol = (Xs - self.means[k]) @ self.chol_inv[k].T               # L^-1 (x - mu)
-            out[:, k] = self._log_norm[k] - 0.5 * np.einsum('nd,nd->n', sol, sol)
-        return out
+    def log_prob_std(self, xs):
+        """Mixture log density at standardized points xs, (n,)."""
+        lp = np.stack([self._log_norm[k] - 0.5 * np.sum(((xs - self.means[k]) @ self.chol_inv[k].T) ** 2, 1)
+                       for k in range(self.n_components)], axis=1)
+        return np.logaddexp.reduce(lp, axis=1)
 
-    def log_prob_std(self, Xs):
-        """Mixture log-density in standardized space, (n,)."""
-        lp = self.component_log_prob(Xs)
-        m = lp.max(axis=1, keepdims=True)
-        return (m + np.log(np.exp(lp - m).sum(axis=1, keepdims=True))).ravel()
-
-    def sample_std(self, n_samples, seed=0, shuffle=True, temperature=1.0):
-        """(Xs, comp): n_samples points in standardized space and their components.
-        Components are drawn as multinomial counts and filled block by block;
-        `shuffle` interleaves them (otherwise the output is sorted by component).
-        `temperature` scales every component's spread (covariance x T^2) around its
-        mean, keeping the mixture weights: T > 1 broadens the distribution, T < 1
-        sharpens it."""
+    def sample(self, n, seed=0, temperature=1.0):
+        """(pz, pt). `temperature` scales every component's spread around its mean
+        (covariance x T^2), keeping the mixture weights."""
         rng = np.random.default_rng(seed)
-        counts = rng.multinomial(n_samples, self.weights)
-        d = self.means.shape[1]
-        Xs = np.empty((n_samples, d))
-        comp = np.repeat(np.arange(self.n_components), counts)
-        start = 0
-        for k, c in enumerate(counts):
-            z = rng.standard_normal((c, d))
-            Xs[start:start + c] = self.means[k] + temperature * (z @ self.chol[k].T)
-            start += c
-        if shuffle:
-            perm = rng.permutation(n_samples)
-            Xs, comp = Xs[perm], comp[perm]
-        return Xs, comp
+        comp = rng.choice(self.n_components, size=n, p=self.weights)
+        z = rng.standard_normal((n, 2))
+        xs = self.means[comp] + temperature * np.einsum("nij,nj->ni", self.chol[comp], z)
+        return fit_to_momentum(xs * self.std + self.mean, self.bounds)
 
-    # ---- physical (pz, pt) space ---- #
-    def sample(self, n_samples, seed=0, shuffle=True, temperature=1.0):
-        """(pz, pt, comp) in physical units (temperature: see sample_std)."""
-        Xs, comp = self.sample_std(n_samples, seed=seed, shuffle=shuffle, temperature=temperature)
-        X = Xs * self.std + self.mean
-        if self.logit:
-            pz, pt = logit_inverse(X, self.meta["p_min"], self.meta["p_max"])
-            return pz, pt, comp
-        X = np.exp(X)
-        return X[:, 0], X[:, 1], comp
-
-    def pdf(self, x):
-        """Density in physical (pz, pt) units at x of shape (n, 2): the standardized
-        density times the Jacobian of the fit space (1 / (prod(std) * pz * pt) for the
-        log space, |d(u, v) / d(pz, pt)| / prod(std) for the logit one)."""
-        x = np.asarray(x, dtype=np.float64)
-        if self.logit:
-            uv, log_jac = logit_space(x[:, 0], x[:, 1], self.meta["p_min"], self.meta["p_max"])
-            Xs = (uv - self.mean) / self.std
-            return np.exp(self.log_prob_std(Xs) + log_jac) / np.prod(self.std)
-        Xs = (np.log(x) - self.mean) / self.std
-        return np.exp(self.log_prob_std(Xs)) / (np.prod(self.std) * np.prod(x, axis=1))
-
-    # ---- torch ---- #
-    def torch_dist(self, device=None, dtype=None):
-        """Equivalent torch.distributions mixture in standardized space (sample /
-        log_prob on GPU); map samples back with x_s * std + mean, then exp (log space)
-        or logit_inverse (logit space)."""
-        import torch
-        from torch.distributions import Categorical, MixtureSameFamily, MultivariateNormal
-        dtype = dtype or torch.float64
-        t = lambda a: torch.as_tensor(a, device=device, dtype=dtype)
-        return MixtureSameFamily(Categorical(probs=t(self.weights)),
-                                 MultivariateNormal(t(self.means), scale_tril=t(self.chol)))
+    def pdf(self, pzpt):
+        """Density in (pz, pt) [GeV^-2]."""
+        uv, log_jac = momentum_to_fit(pzpt[:, 0], pzpt[:, 1], self.bounds)
+        return np.exp(self.log_prob_std((uv - self.mean) / self.std) + log_jac) / np.prod(self.std)

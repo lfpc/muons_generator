@@ -1,3 +1,11 @@
+"""Neural Spline Flow (rational-quadratic spline coupling, Durkan et al. 2019), pure PyTorch.
+
+A flow maps data x to a standard-normal base z through a stack of invertible coupling
+layers: each leaves half the dimensions unchanged and transforms the other half with a
+monotonic rational-quadratic spline whose knots an MLP predicts from the unchanged half
+(and from a context, for a conditional flow). It gives exact log_prob and sampling.
+The flow works in its standardized fit space only; fit_space.py maps to physics.
+"""
 import math
 import os
 
@@ -6,142 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class GMM(torch.nn.Module):
-    def __init__(self, n_components, n_features, reg_covar=1e-6):
-        super(GMM, self).__init__()
-        self.n_components = n_components
-        self.n_features = n_features
-        self.reg_covar = float(reg_covar)
-        
-        # Initialize the parameters of the GMM
-        self.means = torch.nn.Parameter(torch.randn(n_components, n_features))
-        self.covariances = torch.nn.Parameter(torch.eye(n_features).repeat(n_components, 1, 1))
-        self.weights = torch.nn.Parameter(torch.ones(n_components) / n_components)
-
-    def _regularize_covariance(self, covariance: torch.Tensor) -> torch.Tensor:
-        covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
-        eye = torch.eye(self.n_features, device=covariance.device, dtype=covariance.dtype)
-        return covariance + self.reg_covar * eye
-
-    def _log_gaussian(self, x: torch.Tensor, mean: torch.Tensor, covariance: torch.Tensor) -> torch.Tensor:
-        covariance = self._regularize_covariance(covariance)
-        diff = x - mean
-
-        # Cholesky-based quadratic form and logdet (avoids explicit inverse)
-        chol = torch.linalg.cholesky(covariance)
-        sol = torch.cholesky_solve(diff.unsqueeze(-1), chol).squeeze(-1)
-        quad = (diff * sol).sum(dim=-1)
-        logdet = 2.0 * torch.log(torch.diagonal(chol, dim1=-2, dim2=-1)).sum(dim=-1)
-
-        return -0.5 * (quad + logdet + self.n_features * math.log(2.0 * math.pi))
-
-    def _cholesky_with_jitter(self, covariance: torch.Tensor, max_tries: int = 5) -> torch.Tensor:
-        covariance = self._regularize_covariance(covariance)
-        eye = torch.eye(self.n_features, device=covariance.device, dtype=covariance.dtype)
-        jitter = self.reg_covar
-
-        for _ in range(max_tries):
-            chol, info = torch.linalg.cholesky_ex(covariance)
-            if info == 0:
-                return chol
-            jitter = jitter * 10.0
-            covariance = covariance + jitter * eye
-
-        return torch.linalg.cholesky(covariance)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Returns log p(x, component=k) for each k
-        weights = torch.clamp(self.weights, min=1e-12)
-        weights = weights / weights.sum()
-
-        log_probs = []
-        for i in range(self.n_components):
-            log_p_x_given_k = self._log_gaussian(x, self.means[i], self.covariances[i])
-            log_probs.append(log_p_x_given_k + torch.log(weights[i]))
-        return torch.stack(log_probs, dim=1)
-
-    def fit(self, x: torch.Tensor, n_iterations: int = 100) -> "GMM":
-        x = torch.as_tensor(x)
-
-        for _ in range(int(n_iterations)):
-            # E-step
-            log_joint = self.forward(x)
-            log_norm = torch.logsumexp(log_joint, dim=1, keepdim=True)
-            responsibilities = torch.exp(log_joint - log_norm)
-
-            # M-step
-            Nk = responsibilities.sum(dim=0).clamp_min(1e-12)
-            with torch.no_grad():
-                self.weights.copy_(Nk / x.size(0))
-                self.means.copy_((responsibilities.t() @ x) / Nk.unsqueeze(1))
-
-                for i in range(self.n_components):
-                    diff = x - self.means[i]
-                    weighted_diff = responsibilities[:, i].unsqueeze(1) * diff
-                    cov = (weighted_diff.t() @ diff) / Nk[i]
-                    self.covariances[i].copy_(self._regularize_covariance(cov))
-
-        return self
-
-    @torch.no_grad()
-    def sample(self, n_samples: int, return_components: bool = False):
-        """Sample from the fitted GMM.
-
-        Returns:
-            samples: (n_samples, n_features)
-            components (optional): (n_samples,) component indices
-        """
-        n_samples = int(n_samples)
-        weights = torch.clamp(self.weights, min=1e-12)
-        weights = weights / weights.sum()
-
-        component_ids = torch.distributions.Categorical(probs=weights).sample((n_samples,))
-        samples = torch.empty(
-            n_samples,
-            self.n_features,
-            device=self.means.device,
-            dtype=self.means.dtype,
-        )
-
-        for k in range(self.n_components):
-            mask = component_ids == k
-            count = int(mask.sum().item())
-            if count == 0:
-                continue
-
-            chol = self._cholesky_with_jitter(self.covariances[k])
-            eps = torch.randn(count, self.n_features, device=samples.device, dtype=samples.dtype)
-            samples[mask] = self.means[k] + eps @ chol.transpose(0, 1)
-
-        if return_components:
-            return samples, component_ids
-        return samples
-
-
-# ---------------------------------------------------------------------------
-# Neural Spline Flow (rational-quadratic spline coupling), pure PyTorch.
-#
-# A normalizing flow maps data x to a standard-normal base z through a stack of
-# invertible coupling layers. Each layer leaves some dimensions unchanged and
-# transforms the rest with a monotonic rational-quadratic spline whose knots are
-# predicted by an MLP from the unchanged dimensions (Durkan et al. 2019). Splines
-# are far more expressive per layer than affine (RealNVP) coupling, so a few
-# layers model sharp, peaked 2D densities well. The flow gives exact log_prob and
-# exact sampling. Trained by maximizing log_prob (Adam), not EM like GMM above.
-# ---------------------------------------------------------------------------
-
 _MIN_BIN_WIDTH = 1e-3
 _MIN_BIN_HEIGHT = 1e-3
 _MIN_DERIVATIVE = 1e-3
 
 
 def _searchsorted(bin_locations, inputs):
-    """Index of the bin each input falls into.
-
-    A binary search, in place of the old sum(inputs[..., None] >= bin_locations) trick:
-    that materialized an (M, num_bins+1) boolean tensor plus a clone of the locations,
-    hundreds of MB per layer at a 1e6-row batch. Inputs exactly on the right edge come
-    back as num_bins and are clamped by the caller, as they were by the old eps."""
+    """Index of the bin each input falls into (binary search; an input exactly on the
+    right edge comes back as num_bins and is clamped by the caller)."""
     return torch.searchsorted(bin_locations.contiguous(),
                               inputs[..., None].contiguous(), right=True).squeeze(-1) - 1
 
@@ -268,13 +148,8 @@ class _SplineCoupling(nn.Module):
     def __init__(self, dim, mask, hidden, num_bins, tail_bound, context_dim=0):
         super().__init__()
         self.register_buffer("mask", mask)
-        # Integer indices, not the boolean mask, for the split and the recombination:
-        # x[:, bool_mask] is advanced indexing, which runs a nonzero() -- and on CUDA a
-        # nonzero() is a device-to-host sync. Four of those per layer per direction is
-        # ~100 pipeline stalls a training step. index_select/index_copy_ with int64
-        # indices are plain gathers.
-        # persistent=False: they follow the module to the device but stay out of the
-        # state_dict, so checkpoints written before this change still load
+        # integer indices, not the boolean mask: x[:, mask] would cost a device-host
+        # sync per call; not persistent, so they stay out of the state_dict
         self.register_buffer("id_idx", torch.nonzero(mask, as_tuple=True)[0],
                              persistent=False)
         self.register_buffer("tr_idx", torch.nonzero(~mask, as_tuple=True)[0],
@@ -323,7 +198,7 @@ class NeuralSplineFlow(nn.Module):
     quantities is the job of the script that defines it.
 
     With context_dim > 0 it is a conditional flow p(x | c): every coupling MLP also sees
-    the context c, which is not transformed (train_flow_conditional.py). log_prob takes
+    the context c, which is not transformed (train_position_flow.py). log_prob takes
     the context separately or as the last context_dim columns of x, so rows [x, c] run
     through the training loop of flow_training.py unchanged."""
 
@@ -397,9 +272,8 @@ class NeuralSplineFlow(nn.Module):
 
 # ---------------------------------------------------------------------------
 # Checkpoints: one flat dict -- the flow's config and weights, the mean/std that
-# standardize its fit space, and whatever the training script needs to map samples back
-# to physics (its `columns` name the fit space, plus that space's own parameters).
-#
+# standardize its fit space, and the constants of that space (fit_space.py).
+# ---------------------------------------------------------------------------
 
 def save_flow(path, flow, state_dict, mean, std, **meta):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -414,18 +288,3 @@ def load_flow(path, device="cpu"):
     flow = NeuralSplineFlow.from_config(ckpt["config"])
     flow.load_state_dict(ckpt["state_dict"])
     return flow.to(device).eval(), ckpt
-
-
-@torch.no_grad()
-def sample_flow(flow, ckpt, n, convert=None, batch=1 << 21):
-    """n samples of a checkpointed flow as a float32 array, drawn `batch` at a time: in
-    its fit space (destandardized), or passed through `convert` batch by batch -- e.g. a
-    training script's to_physical -- so a large n never exists in float64 at once."""
-    out = None
-    for i in range(0, n, batch):
-        s = flow.sample(min(batch, n - i), mean=ckpt["mean"], std=ckpt["std"]).cpu().numpy()
-        s = convert(s) if convert is not None else s
-        if out is None:
-            out = np.empty((n, s.shape[1]), dtype=np.float32)
-        out[i:i + s.shape[0]] = s
-    return out

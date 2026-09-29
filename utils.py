@@ -1,12 +1,11 @@
 """Data loading and small shared helpers.
 
 The muon file is a flat table: one dataset per column (px, py, pz, x, y, z, pdg,
-weight) and one row per muon, each row carrying its own importance weight. See
-input_files/unify_h5.py, which builds it.
+weight) and one row per muon, each row carrying its own importance weight.
+split_by_weight.py splits it into the groups above_W and below_W.
 """
 import os
 
-import torch
 import h5py
 import numpy as np
 
@@ -56,53 +55,16 @@ def get_real_muons(file_path=DEFAULT_DATA, num_samples=None, columns=COLS,
 def calc_pt(px, py):
     return np.sqrt(px**2 + py**2)
 
+
 def calc_phi(px, py):
     return np.arctan2(py, px)
 
-def generate_px_py(pt):
-    phi = np.random.uniform(0, 2 * np.pi, size=pt.shape[0])
-    px = pt * np.cos(phi)
-    py = pt * np.sin(phi)
-    return px, py
-def generate_charge(num_samples):
-    # Randomly assign charge +1 or -1 with equal probability
-    charges = np.random.choice([-1, 1], size=num_samples)
-    return charges
-def generate_pdg(num_samples):
-    # Randomly assign PDG code for muons (13 for muon, -13 for anti-muon)
-    pdg_codes = (-13) * generate_charge(num_samples)
-    return pdg_codes
 
 def generate_position(num_samples, SmearBeamRadius=5.0, sigma=1.6, fixed_z=-1.9):
-    #ring transformation
-    gauss_x = np.random.normal(0, sigma, size=num_samples)
-    gauss_y = np.random.normal(0, sigma, size=num_samples)
-    uniform = np.random.uniform(0, 1, size=num_samples)
-    _phi = uniform * 2 * np.pi
-    x = SmearBeamRadius * np.cos(_phi) + gauss_x
-    y = SmearBeamRadius * np.sin(_phi) + gauss_y
-    x = x / 100
-    y = y / 100
-    z = np.full(num_samples, fixed_z)
-    return x, y, z
-
-
-def train_val_split(X, val_frac=0.2, seed=0):
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(X))
-    rng.shuffle(idx)
-    n_val = int(len(X) * val_frac)
-    val_idx = idx[:n_val]
-    train_idx = idx[n_val:]
-    return X[train_idx], X[val_idx]
-
-
-def standardize_train_val(X_train, X_val):
-    mean = X_train.mean(axis=0, keepdims=True)
-    std = X_train.std(axis=0, keepdims=True) + 1e-12
-    X_train_s = (X_train - mean) / std
-    X_val_s = (X_val - mean) / std
-    return X_train_s, X_val_s, mean, std
-
-if __name__ == "__main__":
-    print(get_real_muons(num_samples=1000).shape)
+    """The beam spot: a ring of radius SmearBeamRadius [cm] smeared by a Gaussian of
+    width sigma [cm], returned in m, at a fixed z. simulation_test.py adds it to the
+    production point of real and generated muons alike."""
+    phi = np.random.uniform(0, 2 * np.pi, size=num_samples)
+    x = SmearBeamRadius * np.cos(phi) + np.random.normal(0, sigma, size=num_samples)
+    y = SmearBeamRadius * np.sin(phi) + np.random.normal(0, sigma, size=num_samples)
+    return x / 100, y / 100, np.full(num_samples, fixed_z)

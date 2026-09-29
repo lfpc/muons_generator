@@ -1,99 +1,62 @@
+"""Compare the momentum GMM (gmm_model.py) with the real muons: the (pz, pt) density and
+its marginals (combined_gmm.png), their normalized W1 and the rate-weighted NLL.
+
+The real side comes from the same cache as test_generator.py (--hists, --load_hists).
+
+Run: python test_gmm.py --load_hists
+"""
 import argparse
 import os
 import sys
-# utils.py / gen_eval.py live in the parent directory
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-import matplotlib.pyplot as plt
 
-from gmm_model import GMM
-from train_gmm import DEFAULT_SPLIT
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gen_eval as ge
-from gen_eval import (grid_points, grid_normalize, real_pzpt,
-                      hist2d_density, draw_hist2d, shared_lognorm, plot_compare,
-                      save_plot, report_saved_plots, report_metrics,
-                      load_real, figs_dir)
+from gmm_model import GMM
+from utils import get_real_muons
 
-parser = argparse.ArgumentParser(description="Sample, plot and score a trained GMM",
-                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument("--model", type=str, default="outputs/gmm_model.json",
-                    help="Model from train_gmm.py")
-parser.add_argument("--data", type=str, default=DEFAULT_SPLIT,
-                    help="Real muon file for comparison (set to '' to skip)")
-parser.add_argument("--group", type=str, default=None,
-                    help="Group of --data to compare against (default: the model's "
-                         "training group; '' for a pooled file)")
-parser.add_argument("--num_samples", type=int, default=100_000_000,
-                    help="Samples for the marginal/W1 comparison (and the 2D histogram unless --pdf)")
-parser.add_argument("--data_samples", type=int, default=0,
-                    help="Cap on real muons loaded for comparison")
-parser.add_argument("--pdf", action="store_true",
-                    help="Draw the generated 2D histograms from the analytic model PDF "
-                         "instead of sampling and histogramming")
-parser.add_argument("--show", action="store_true")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class ArgFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    pass
+
+
+parser = argparse.ArgumentParser(description=__doc__, formatter_class=ArgFormatter)
+parser.add_argument("--model", default="outputs/gmm_model.json", help="GMM from train_gmm.py")
+parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+parser.add_argument("--data", default=ge.DEFAULT_DATA, help="Real muon file")
+parser.add_argument("--data_samples", type=int, default=None, help="Cap on the real muons read (None = all)")
+parser.add_argument("--num_samples", type=int, default=100_000_000, help="Generated muons")
+parser.add_argument("--nll_rows", type=int, default=5_000_000, help="Real muons the NLL is computed on")
+parser.add_argument("--hists", default=os.path.join(ROOT, "outputs/real_hists.npz"),
+                    help="Cache of the real side of the figures")
+parser.add_argument("--load_hists", action="store_true", help="Reuse --hists instead of reading --data")
+parser.add_argument("--show", action="store_true", help="Show the figures as well")
 args = parser.parse_args()
+ge.figs_dir = os.path.join(ROOT, "outputs/figs/")
+os.makedirs(ge.figs_dir, exist_ok=True)
 
-
-os.makedirs(figs_dir, exist_ok=True)
-
-print(f"Loading model from {args.model} ...")
 gmm = GMM.load(args.model)
-
-
-def gmm_density_grid(gmm):
-    """Analytic 2D density grid of the GMM (drop-in for a sampled histogram)."""
-    grid, shape = grid_points()
-    return grid_normalize(gmm.pdf(grid)).reshape(shape)
-
-
-def sample_all():
-    pz, pt, _ = gmm.sample(args.num_samples, seed=0)
-    return np.stack([pz, pt], axis=1)
-
-
-# ---- combined generated 2D histogram ----
-# --pdf: evaluate the GMM PDF analytically on the grid (exact, no sampling).
-# otherwise: sample the model and histogram the samples the normal way.
-if args.pdf:
-    Hg = gmm_density_grid(gmm)
-    gen_all = None
+print(f"Loaded {args.model}: K={gmm.n_components}")
+if args.load_hists:
+    ge.load_cache(args.hists)
+    real = real_w = None
 else:
-    gen_all = sample_all()
-    print(f"Generated {gen_all.shape[0]} samples for the generated histogram.")
-    Hg = hist2d_density(gen_all)
+    ge.use_cache({})
+    real, real_w = ge.load_real(args.data, args.data_samples)
 
-fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
-im = draw_hist2d(ax, Hg, shared_lognorm(Hg),
-                 title=f"GMM ({'analytic PDF' if args.pdf else 'sampled'})")
-fig.colorbar(im, ax=ax, label='density')
-save_plot(fig, 'generated_momentum.png')
-if args.show:
-    plt.show()
+pz, pt = gmm.sample(args.num_samples, temperature=args.temperature)
+w1 = ge.plot_compare(None if real is None else ge.real_pzpt(real), np.column_stack([pz, pt]), real_w,
+                     f"Real (rate-weighted) vs GMM (K={gmm.n_components})", "combined_gmm.png",
+                     gen_label=f"GMM (N={args.num_samples:,})", show=args.show)
+ge.report_metrics({"pz, pt": w1})
 
-# ---- comparison against real data ----
-if not args.data:
-    print("No --data given; skipping real-vs-generated comparison and metric plot.")
-    report_saved_plots()
-    raise SystemExit
-
-# Samples are needed for the 1D marginals and the W1 metric (and, without --pdf,
-# already drawn above for the 2D histogram).
-if gen_all is None:
-    gen_all = sample_all()
-print(f"Using {gen_all.shape[0]} samples for the marginal/W1 comparison.")
-
-group = gmm.meta.get("group") if args.group is None else (args.group or None)
-real, real_all_w = load_real(args.data, args.data_samples, group=group)
-real_all = real_pzpt(real)
-
-# real (rate-weighted) vs generated. The generated 2D panel reuses Hg (analytic if
-# --pdf, else the sampled histogram of gen_all).
-gen_label = 'generated (analytic PDF)' if args.pdf else f'generated (N={gen_all.shape[0]})'
-w1 = plot_compare(real_all, gen_all, real_all_w,
-                  'Real (rate-weighted) vs generated — GMM',
-                  'compare_combined.png', gen_density=Hg, gen_label=gen_label, show=args.show)
-metrics = {'pz, pt': w1}
-
-report_metrics(metrics)
-report_saved_plots()
+data = get_real_muons(args.data, args.nll_rows, columns=("px", "py", "pz", "weight")).astype(np.float64)
+w = data[:, 3].astype(np.float64)
+nll = -(w @ np.log(gmm.pdf(np.column_stack([data[:, 2], np.hypot(data[:, 0], data[:, 1])])))) / w.sum()
+print(f"Rate-weighted NLL of (pz, pt) over {len(data):,} real muons: {nll:.5f} nats/muon")
+if not args.load_hists:
+    ge.save_cache(args.hists)
+ge.report_saved_plots()

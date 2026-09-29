@@ -1,9 +1,8 @@
-"""Shared evaluation/plotting helpers for the generative models.
+"""Plots and metrics comparing generated muons with the real ones.
 
 Model-agnostic: every plot takes real muons, generated muons and the real per-row
-importance weights, so test_gmm.py and test_flow.py render identically. The
-model-specific bits (how to sample, how to evaluate the density on the grid) live in
-the respective test scripts.
+importance weights (test_generator.py, gmm/test_gmm.py). Every real-side value is
+requested through cached(), so a saved cache replaces the 2.3e9-row file.
 """
 import os
 
@@ -35,15 +34,6 @@ def hist2d_density(xy, w=None):
     return H
 
 
-def hist2d_counts(xy, w=None):
-    """Unnormalized 2D pz-pt histogram (raw/weighted counts) on the shared grid. Used
-    to accumulate a density across many sampled chunks without ever holding all of them
-    in memory at once (see test_flow.py's --generated_weighted_sample); normalize the
-    accumulated total with grid_normalize() once done."""
-    H, _, _ = np.histogram2d(xy[:, 0], xy[:, 1], bins=[PZ_BINS, PT_BINS], weights=w)
-    return H
-
-
 def draw_hist2d(ax, H, norm, title=None):
     """Draw a precomputed density on the shared grid in log color scale."""
     im = ax.pcolormesh(PZ_BINS, PT_BINS, H.T, cmap='viridis', norm=norm)
@@ -68,8 +58,7 @@ def shared_lognorm(*grids, floor=1e-8):
 
 
 def grid_points():
-    """Bin centers of the shared grid as an (Ngrid, 2) array, plus the 2D shape.
-    Used by the analytic-density code in each test script."""
+    """Bin centers of the shared grid as an (Ngrid, 2) array, plus the 2D shape."""
     pz_c = 0.5 * (PZ_BINS[:-1] + PZ_BINS[1:])
     pt_c = 0.5 * (PT_BINS[:-1] + PT_BINS[1:])
     PZ, PT = np.meshgrid(pz_c, pt_c, indexing='ij')
@@ -304,13 +293,8 @@ def plot_compare(real, gen, real_w, suptitle, fname, gen_density=None, gen_label
 
 
 # --------------------------------------------------------------------------- #
-# position / charge comparison (only for a model that generates the full muon state,
-# i.e. train_flow_complete.py -- train_flow_momenta.py fakes x, y, z downstream)
-#
-# Both `real` and `gen` here are physical (px, py, pz, x, y, z, pdg) arrays -- real[:, :7]
-# and train_flow_complete.to_physical produce the same layout -- so the same derivations
-# apply to each. Mirrors the plots in
-# see_data.py (x-y density, z distribution) with a real-vs-generated panel each.
+# position / charge comparison. Both `real` and `gen` are physical (px, py, pz, x, y, z,
+# pdg) arrays -- real[:, :7] and MuonGenerator.sample produce the same layout.
 # --------------------------------------------------------------------------- #
 Z_TARGET = -2.14          # target position, as marked in see_data.py
 Z_TARGET_END = -2.14 + 1.595
@@ -318,8 +302,7 @@ Z_TARGET_END = -2.14 + 1.595
 
 def derived_position(arr):
     """(r, |dphi|, charge) from a physical array: radius, momentum azimuth relative to
-    the position azimuth, and charge. These are the quantities train_flow_complete.py
-    actually fits, so they are what the comparison should be made in."""
+    the position azimuth, and charge -- what the position flow is fit on."""
     px, py, x, y, pdg = arr[:, 0], arr[:, 1], arr[:, 3], arr[:, 4], arr[:, 6]
     dphi = np.arctan2(py, px) - np.arctan2(y, x)
     return (np.hypot(x, y),
@@ -359,7 +342,7 @@ def plot_position_xy(real, gen, real_w=None, fname='position_xy.png', show=False
 
 
 def plot_position_marginals(real, gen, real_w=None, fname='marginals.png', show=False):
-    """1D marginals of everything the position/charge part of the flow models --
+    """1D marginals of everything the position flow and the charge describe --
     x, y, z, r (log axis: it spans decades), |dphi| and charge -- plus the momentum
     components px, py, pz, which the position parameterization feeds into (px and py are
     pt rotated by the generated azimuth, so they are only right if r and |dphi| are).

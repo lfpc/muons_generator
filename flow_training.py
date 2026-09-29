@@ -1,4 +1,11 @@
 
+"""Data loading, standardization and the training loop shared by the two flows
+(train_momentum_flow.py, train_position_flow.py).
+
+Every row carries its importance weight, and the loss is the rate-weighted NLL. The split
+file (split_by_weight.py) is read as its two groups and each batch mixes them, --hi_frac
+from above_W, with the weights rescaled so the loss still sees the natural mix.
+"""
 import argparse
 import os
 import time
@@ -22,7 +29,7 @@ class ArgFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescripti
 
 
 def make_parser(doc, out):
-    """An argument parser with the flags every train_flow_*.py script takes."""
+    """An argument parser with the flags both training scripts take."""
     p = argparse.ArgumentParser(description=doc, formatter_class=ArgFormatter)
     p.add_argument("--data", default=DEFAULT_SPLIT,
                    help="split_by_weight.py output, or the pooled table (utils.DEFAULT_DATA)")
@@ -31,31 +38,31 @@ def make_parser(doc, out):
                         "proportion, with the weights scaled so the rate is unchanged")
     p.add_argument("--hi_frac", type=float, default=0.5,
                    help="Split file only: fraction of each batch drawn from above_W")
-    p.add_argument("--n_layers", type=int, default=12)
-    p.add_argument("--hidden", type=int, nargs="+", default=[128, 128])
-    p.add_argument("--num_bins", type=int, default=12)
+    p.add_argument("--n_layers", type=int, default=12, help="Coupling layers")
+    p.add_argument("--hidden", type=int, nargs="+", default=[128, 128], help="Widths of each coupling MLP")
+    p.add_argument("--num_bins", type=int, default=12, help="Spline bins per dimension")
     p.add_argument("--tail_bound", type=float, default=6.0,
                    help="Spline box in standardized units: identity outside it, so the "
                         "flow can essentially not generate anything beyond +-tail_bound")
     p.add_argument("--epochs", type=int, default=150,
                    help="An epoch is one pass over above_W (split file) or all rows")
-    p.add_argument("--batch_size", type=int, default=2**19)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--batch_size", type=int, default=2**19, help="Rows per training step")
+    p.add_argument("--lr", type=float, default=1e-3, help="Initial Adam learning rate")
     p.add_argument("--lr_factor", type=float, default=0.5,
                    help="LR multiplier when the val NLL plateaus")
     p.add_argument("--lr_patience", type=int, default=5,
                    help="Epochs without improvement before the LR drops")
-    p.add_argument("--min_lr", type=float, default=1e-6)
+    p.add_argument("--min_lr", type=float, default=1e-6, help="Floor of the learning rate")
     p.add_argument("--patience", type=int, default=30, help="Early-stopping patience (epochs)")
-    p.add_argument("--val_frac", type=float, default=0.05)
+    p.add_argument("--val_frac", type=float, default=0.05, help="Fraction of rows held out for validation")
     p.add_argument("--max_val_samples", type=int, default=3_000_000,
                    help="Cap on the validation set, so evaluating it every epoch is cheap")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
                    help="torch.compile the training log_prob (fuses the spline's many small "
-                        "kernels, see bench_flow.py)")
-    p.add_argument("--seed", type=int, default=0)
+                        "kernels)")
+    p.add_argument("--seed", type=int, default=0, help="Random seed")
     p.add_argument("--device", default=None, help="cuda / cpu (auto if omitted)")
-    p.add_argument("--out", default=out)
+    p.add_argument("--out", default=out, help="Output checkpoint")
     return p
 
 

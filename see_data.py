@@ -1,5 +1,5 @@
 """Plot and summarize the real muon sample: the raw columns, the quantities the
-generative models actually fit (|p|, theta, |dphi|, r, charge -- see train_flow_complete.py), and a
+generative models actually fit (|p|, theta, |dphi|, r, charge -- see fit_space.py), and a
 corner plot of each set. Every histogram is weighted by the per-row importance weight, so
 what is shown is the physical (rate-weighted) distribution.
 
@@ -29,7 +29,7 @@ BINS = 120
 GEN_SAMPLES = 5_000_000        # draws used to illustrate the beam-spot generator
 
 # name -> (axis label, binned in log10 space?). The derived entries are defined exactly
-# as train_flow_complete.py fits them.
+# as the generator's flows fit them (fit_space.py).
 QUANTS = {
     'px': ('$P_x$ [GeV]', False), 'py': ('$P_y$ [GeV]', False), 'pz': ('$P_z$ [GeV]', False),
     'x': ('x [m]', False), 'y': ('y [m]', False), 'z': ('z [m]', False),
@@ -46,7 +46,7 @@ DERIVED = ('pt', 'phi', 'p', 'theta', 'r', 'dphi', 'charge')
 PLOTTED = ('px', 'py', 'pz', 'x', 'y', 'z', 'pt', 'phi', 'p', 'theta', 'r', 'dphi', 'charge',
            'weight')
 CORNER_RAW = ('x', 'y', 'z', 'px', 'py', 'pz')
-CORNER_GEN = ('p', 'theta', 'dphi', 'r', 'z', 'charge')  # what train_flow_complete.py models
+CORNER_GEN = ('p', 'theta', 'dphi', 'r', 'z', 'charge')  # what the generator models
 NAMED_2D = (('pz', 'pt'), ('p', 'theta'), ('x', 'y'), ('r', 'pz'), ('r', 'dphi'))
 FIXED = {'charge': (-1.5, 1.5, 3)}                  # charge takes two values: 3 bins, not 120
 MARGINALS = (('x', 'y', 'z'), ('px', 'py', 'pz'))   # draw_marginals grid, positions over momenta
