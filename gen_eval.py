@@ -216,9 +216,10 @@ def real_pzpt(arr):
     return np.stack([arr[:, 2], calc_pt(arr[:, 0], arr[:, 1])], axis=1)
 
 
-def load_real(data_path=DEFAULT_DATA, num_samples=None):
-    """Real muons as (N, 8) float32 plus a view on the weight column."""
-    real = get_real_muons(data_path, num_samples)
+def load_real(data_path=DEFAULT_DATA, num_samples=None, group=None):
+    """Real muons as (N, 8) float32 plus a view on the weight column. `group` reads a
+    single group of a split file (e.g. 'above_W')."""
+    real = get_real_muons(data_path, num_samples, group=group)
     return real, real[:, 7]
 
 

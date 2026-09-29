@@ -184,7 +184,7 @@ def compiled_log_prob(flow, enabled, batch_size, device):
     try:
         fn = torch.compile(flow.log_prob, dynamic=False)
         t0 = time.time()
-        fn(torch.zeros(batch_size, flow.dim, device=device)).sum().backward()
+        fn(torch.zeros(batch_size, flow.dim + flow.context_dim, device=device)).sum().backward()
         flow.zero_grad(set_to_none=True)
         print(f"torch.compile: graph built in {time.time() - t0:.0f}s")
         return fn

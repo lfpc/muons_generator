@@ -1,4 +1,7 @@
 import os
+import sys
+# utils.py / gen_eval.py live in the parent directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Cap BLAS threads BEFORE importing numpy/sklearn: OpenBLAS was built for a
 # max of 128 threads and segfaults if more cores are available.
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
@@ -15,9 +18,11 @@ from matplotlib.colors import LogNorm
 from sklearn.mixture import GaussianMixture
 from scipy.special import logsumexp
 from scipy.linalg import solve_triangular
+from gmm_model import save_gmm
 
 figs_dir = 'outputs/figs/'
 show = False
+DEFAULT_SPLIT = os.path.join(os.path.dirname(DEFAULT_DATA), 'muons_data_split.h5')
 
 
 def fit_gmm_grid(X_train_s, X_val_s, n_components_list, random_state=0):
@@ -241,22 +246,12 @@ def fit_gmm_batched(X, w, mean, std, n_components, batch_size=5_000_000, init=No
     return _pack_gmm(weights, means, covs, reg_covar, n_iter, lower_bound), lower_bound
 
 
-def sample_gmm(gmm, mean, std, n_samples, seed=0):
-    Xgen_s, comp = gmm.sample(n_samples)
-    Xgen = Xgen_s * std + mean
-
-    pz_gen = Xgen[:, 0]
-    pt_gen = Xgen[:, 1]
-    #pt_gen = np.expm1(Xgen[:, 1])
-    #pt_gen = np.clip(pt_gen, 0.0, None)
-
-    return pz_gen, pt_gen, comp
-
 if __name__ == "__main__":
     import argparse
-    import pickle
     parser = argparse.ArgumentParser(description="Train GMM on muon data",
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--data", type=str, default=DEFAULT_SPLIT, help="Split muon file (split_by_weight.py output)")
+    parser.add_argument("--group", type=str, default="above_W", help="Group of --data to train on; the rest of the file is ignored")
     parser.add_argument("--num_samples", type=int, default=None, help="Row cap on the data loaded (None = all)")
     parser.add_argument("--components", type=int, nargs="+", default=[2,4,8,16,24], help="List of number of GMM components to try")
     parser.add_argument("--batch_size", type=int, default=5_000_000, help="Chunk size for streaming EM")
@@ -264,13 +259,17 @@ if __name__ == "__main__":
     parser.add_argument("--max_iter", type=int, default=100, help="Max EM iterations for the full-data fit")
     parser.add_argument("--tol", type=float, default=1e-4, help="Convergence tolerance on avg log-likelihood")
     parser.add_argument("--val_frac", type=float, default=0.2, help="Validation fraction for K selection")
+    parser.add_argument("--out", type=str, default="outputs/gmm_model.json", help="Output model file (JSON, see gmm_model.py)")
     args = parser.parse_args()
 
-    arr = get_real_muons(num_samples=args.num_samples, columns=('pz', 'px', 'py', 'weight'))
-    X = np.stack([arr[:, 0], calc_pt(arr[:, 1], arr[:, 2])], axis=1)      # [pz, pt]
+    arr = get_real_muons(args.data, num_samples=args.num_samples,
+                         columns=('pz', 'px', 'py', 'weight'), group=args.group)
+    # fit space is (log pz, log pt): both are strictly positive in the data
+    X = np.stack([np.log(arr[:, 0]), np.log(calc_pt(arr[:, 1], arr[:, 2]))], axis=1)
     w = arr[:, 3]
     del arr
-    print(f"\n========== Training GMM on N={X.shape[0]:,} muons ==========")
+    assert np.isfinite(X).all(), "non-positive pz or pt: log is undefined"
+    print(f"\n========== Training GMM on N={X.shape[0]:,} muons ({args.group}) ==========")
 
     # standardization stats over all data, rate-weighted (single streaming pass)
     mean, std = _mean_std_batched(X, w, args.batch_size)
@@ -293,10 +292,10 @@ if __name__ == "__main__":
         )
     print(f"  Full-data fit complete in {time() - t0:.1f}s | avg_ll={train_ll:.6f}")
 
-    # "weight" is the physical rate mass, as in the flow checkpoints
-    model = {"gmm": gmm, "mean": mean, "std": std,
-             "weight": float(w.sum(dtype=np.float64))}
-
-    with open("outputs/gmm_model.pkl", "wb") as f:
-        pickle.dump(model, f)
+    # "weight" is the physical rate mass (of --group only), as in the flow checkpoints.
+    # mean/std and the GMM params are in (log pz, log pt) space.
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    save_gmm(args.out, gmm.weights_, gmm.means_, gmm.covariances_, mean, std,
+             weight=float(w.sum(dtype=np.float64)), space="log", group=args.group)
+    print(f"Saved {args.out}")
 

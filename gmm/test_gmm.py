@@ -1,12 +1,14 @@
 import argparse
 import os
-import pickle
+import sys
+# utils.py / gen_eval.py live in the parent directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.special import logsumexp
 
-from train_gmm import sample_gmm, _log_gaussian_full
+from gmm_model import GMM
+from train_gmm import DEFAULT_SPLIT
 import gen_eval as ge
 from gen_eval import (grid_points, grid_normalize, real_pzpt,
                       hist2d_density, draw_hist2d, shared_lognorm, plot_compare,
@@ -15,13 +17,16 @@ from gen_eval import (grid_points, grid_normalize, real_pzpt,
 
 parser = argparse.ArgumentParser(description="Sample, plot and score a trained GMM",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument("--model", type=str, default="outputs/gmm_model.pkl",
+parser.add_argument("--model", type=str, default="outputs/gmm_model.json",
                     help="Model from train_gmm.py")
-parser.add_argument("--data", type=str, default=ge.DEFAULT_DATA,
+parser.add_argument("--data", type=str, default=DEFAULT_SPLIT,
                     help="Real muon file for comparison (set to '' to skip)")
+parser.add_argument("--group", type=str, default=None,
+                    help="Group of --data to compare against (default: the model's "
+                         "training group; '' for a pooled file)")
 parser.add_argument("--num_samples", type=int, default=100_000_000,
                     help="Samples for the marginal/W1 comparison (and the 2D histogram unless --pdf)")
-parser.add_argument("--data_samples", type=int, default=2_000_000,
+parser.add_argument("--data_samples", type=int, default=0,
                     help="Cap on real muons loaded for comparison")
 parser.add_argument("--pdf", action="store_true",
                     help="Draw the generated 2D histograms from the analytic model PDF "
@@ -30,34 +35,20 @@ parser.add_argument("--show", action="store_true")
 args = parser.parse_args()
 
 
-# --------------------------------------------------------------------------- #
-# GMM-specific pieces. The GMM is fit in standardized space x_s = (x-mean)/std,
-# so its density in physical units is p_std((x-mean)/std) / (std_pz*std_pt).
-# --------------------------------------------------------------------------- #
-def gmm_phys_density(gmm, mean, std, grid):
-    mean = np.asarray(mean, dtype=float).ravel()
-    std = np.asarray(std, dtype=float).ravel()
-    Xs = (grid - mean) / std
-    log_prob = _log_gaussian_full(Xs, gmm.means_, gmm.covariances_) + np.log(gmm.weights_)
-    return np.exp(logsumexp(log_prob, axis=1)) / np.prod(std)
-
-
-def gmm_density_grid(gmm, mean, std):
-    """Analytic 2D density grid of a single GMM (drop-in for a sampled histogram)."""
-    grid, shape = grid_points()
-    return grid_normalize(gmm_phys_density(gmm, mean, std, grid)).reshape(shape)
-
-
 os.makedirs(figs_dir, exist_ok=True)
 
-with open(args.model, 'rb') as f:
-    print(f"Loading model from {args.model} ...")
-    model = pickle.load(f)
+print(f"Loading model from {args.model} ...")
+gmm = GMM.load(args.model)
+
+
+def gmm_density_grid(gmm):
+    """Analytic 2D density grid of the GMM (drop-in for a sampled histogram)."""
+    grid, shape = grid_points()
+    return grid_normalize(gmm.pdf(grid)).reshape(shape)
 
 
 def sample_all():
-    pz, pt, _ = sample_gmm(model["gmm"], model["mean"], model["std"],
-                           n_samples=args.num_samples, seed=0)
+    pz, pt, _ = gmm.sample(args.num_samples, seed=0)
     return np.stack([pz, pt], axis=1)
 
 
@@ -65,7 +56,7 @@ def sample_all():
 # --pdf: evaluate the GMM PDF analytically on the grid (exact, no sampling).
 # otherwise: sample the model and histogram the samples the normal way.
 if args.pdf:
-    Hg = gmm_density_grid(model["gmm"], model["mean"], model["std"])
+    Hg = gmm_density_grid(gmm)
     gen_all = None
 else:
     gen_all = sample_all()
@@ -92,7 +83,8 @@ if gen_all is None:
     gen_all = sample_all()
 print(f"Using {gen_all.shape[0]} samples for the marginal/W1 comparison.")
 
-real, real_all_w = load_real(args.data, args.data_samples)
+group = gmm.meta.get("group") if args.group is None else (args.group or None)
+real, real_all_w = load_real(args.data, args.data_samples, group=group)
 real_all = real_pzpt(real)
 
 # real (rate-weighted) vs generated. The generated 2D panel reuses Hg (analytic if

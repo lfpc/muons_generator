@@ -16,7 +16,7 @@ CHUNK = 5_000_000        # rows read from HDF5 at a time
 
 
 def get_real_muons(file_path=DEFAULT_DATA, num_samples=None, columns=COLS,
-                   rescale_weights=True):
+                   rescale_weights=True, group=None):
     """The muon table as one (N, len(columns)) float32 array, columns in `columns`
     order -- (px, py, pz, x, y, z, pdg, weight) by default, i.e. the layout the rest of
     the repo indexes positionally.
@@ -27,8 +27,13 @@ def get_real_muons(file_path=DEFAULT_DATA, num_samples=None, columns=COLS,
     sub-sample still carries the full physical rate; without it the weights are the
     file's own. Reading is chunked straight into the output array -- a whole-column read
     of 2.3e9 rows would be 9 GB of temporaries per column.
+
+    `group` reads a single group of a split file (split_by_weight.py), e.g. 'above_W';
+    the other groups are never touched and n_total is that group's size.
     """
     with h5py.File(file_path, 'r') as f:
+        if group is not None:
+            f = f[group]
         n_total = f[columns[0]].shape[0]
         n = n_total if not num_samples else min(num_samples, n_total)
         out = np.empty((n, len(columns)), dtype=np.float32)
@@ -37,6 +42,8 @@ def get_real_muons(file_path=DEFAULT_DATA, num_samples=None, columns=COLS,
             for c, name in enumerate(columns):
                 out[sl, c] = f[name][sl]
     msg = f"Loaded {n:,} of {n_total:,} muons from {file_path}"
+    if group is not None:
+        msg += f" [{group}]"
     if 'weight' in columns:
         w = out[:, columns.index('weight')]
         if rescale_weights and n < n_total:

@@ -108,6 +108,9 @@ def print_box(mean, std, bound, m):
 if __name__ == "__main__":
     parser = ft.make_parser(__doc__, "outputs/flow_model_ploss.pt")
     add_args(parser)
+    # compare_gmm_flow.py --space momentum: with 4 coupling layers every width from 4 to
+    # 128 gives the same test NLL; 4 x 16 (3.7k parameters) matches the old 12 x 128 (258k)
+    parser.set_defaults(n_layers=4, hidden=[16, 16])
     args = parser.parse_args()
     device = ft.setup(args)
 

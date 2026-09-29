@@ -263,9 +263,9 @@ def _make_mlp(in_dim, out_dim, hidden):
 
 class _SplineCoupling(nn.Module):
     """One coupling layer: pass through masked dims, spline-transform the rest with
-    knot parameters predicted from the passed-through dims."""
+    knot parameters predicted from the passed-through dims (and the context, if any)."""
 
-    def __init__(self, dim, mask, hidden, num_bins, tail_bound):
+    def __init__(self, dim, mask, hidden, num_bins, tail_bound, context_dim=0):
         super().__init__()
         self.register_buffer("mask", mask)
         # Integer indices, not the boolean mask, for the split and the recombination:
@@ -283,19 +283,20 @@ class _SplineCoupling(nn.Module):
         self.tail_bound = float(tail_bound)
         self.id_dim = int(mask.sum().item())
         self.tr_dim = dim - self.id_dim
-        self.net = _make_mlp(self.id_dim, self.tr_dim * (3 * num_bins + 1), hidden)
+        self.net = _make_mlp(self.id_dim + context_dim, self.tr_dim * (3 * num_bins + 1), hidden)
 
-    def _params(self, id_part, n):
-        p = self.net(id_part).view(n, self.tr_dim, 3 * self.num_bins + 1)
+    def _params(self, id_part, n, context=None):
+        inp = id_part if context is None else torch.cat([id_part, context], 1)
+        p = self.net(inp).view(n, self.tr_dim, 3 * self.num_bins + 1)
         return (p[..., :self.num_bins],
                 p[..., self.num_bins:2 * self.num_bins],
                 p[..., 2 * self.num_bins:])
 
-    def forward(self, x):                # data -> base; returns (z, logabsdet)
+    def forward(self, x, context=None):  # data -> base; returns (z, logabsdet)
         n = x.shape[0]
         id_part = x.index_select(1, self.id_idx)
         tr_part = x.index_select(1, self.tr_idx)
-        w, h, d = self._params(id_part, n)
+        w, h, d = self._params(id_part, n, context)
         out, logabsdet = unconstrained_rational_quadratic_spline(
             tr_part, w, h, d, inverse=False, tail_bound=self.tail_bound)
         z = torch.empty_like(x)
@@ -303,11 +304,11 @@ class _SplineCoupling(nn.Module):
         z.index_copy_(1, self.tr_idx, out)
         return z, logabsdet.sum(-1)
 
-    def inverse(self, z):                # base -> data
+    def inverse(self, z, context=None):  # base -> data
         n = z.shape[0]
         id_part = z.index_select(1, self.id_idx)
         tr_part = z.index_select(1, self.tr_idx)
-        w, h, d = self._params(id_part, n)
+        w, h, d = self._params(id_part, n, context)
         out, _ = unconstrained_rational_quadratic_spline(
             tr_part, w, h, d, inverse=True, tail_bound=self.tail_bound)
         x = torch.empty_like(z)
@@ -319,11 +320,18 @@ class _SplineCoupling(nn.Module):
 class NeuralSplineFlow(nn.Module):
     """RQ-spline coupling flow over `dim`-D data with a standard-normal base. It lives
     entirely in its (standardized) fit space: mapping that space to and from physical
-    quantities is the job of the script that defines it."""
+    quantities is the job of the script that defines it.
 
-    def __init__(self, dim=2, n_layers=6, hidden=(128, 128), num_bins=12, tail_bound=14.0):
+    With context_dim > 0 it is a conditional flow p(x | c): every coupling MLP also sees
+    the context c, which is not transformed (train_flow_conditional.py). log_prob takes
+    the context separately or as the last context_dim columns of x, so rows [x, c] run
+    through the training loop of flow_training.py unchanged."""
+
+    def __init__(self, dim=2, n_layers=6, hidden=(128, 128), num_bins=12, tail_bound=14.0,
+                 context_dim=0):
         super().__init__()
         self.dim = dim
+        self.context_dim = int(context_dim)
         self.n_layers = n_layers
         self.hidden = tuple(hidden)
         self.num_bins = num_bins
@@ -331,37 +339,55 @@ class NeuralSplineFlow(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             mask = (torch.arange(dim) % 2 == (i % 2))     # alternate which dims pass through
-            self.layers.append(_SplineCoupling(dim, mask, self.hidden, num_bins, self.tail_bound))
+            self.layers.append(_SplineCoupling(dim, mask, self.hidden, num_bins, self.tail_bound,
+                                               self.context_dim))
 
     @property
     def config(self):
-        return dict(dim=self.dim, n_layers=self.n_layers, hidden=list(self.hidden),
-                    num_bins=self.num_bins, tail_bound=self.tail_bound)
+        cfg = dict(dim=self.dim, n_layers=self.n_layers, hidden=list(self.hidden),
+                   num_bins=self.num_bins, tail_bound=self.tail_bound)
+        if self.context_dim:                 # unconditional configs stay as they were
+            cfg["context_dim"] = self.context_dim
+        return cfg
+
+    def _split_context(self, x, context):
+        if context is None and self.context_dim:
+            return x[:, :self.dim], x[:, self.dim:]
+        return x, context
 
     @classmethod
     def from_config(cls, cfg):
         return cls(**cfg)
 
-    def forward(self, x):                # data -> base, total logabsdet
+    def forward(self, x, context=None):  # data -> base, total logabsdet
+        x, context = self._split_context(x, context)
         logdet = x.new_zeros(x.shape[0])
         z = x
         for layer in self.layers:
-            z, ld = layer(z)
+            z, ld = layer(z, context)
             logdet = logdet + ld
         return z, logdet
 
-    def log_prob(self, x):
-        z, logdet = self.forward(x)
+    def log_prob(self, x, context=None):
+        """log p(x) (log p(x | context) for a conditional flow), x standardized."""
+        z, logdet = self.forward(x, context)
         base = (-0.5 * (z.pow(2) + math.log(2.0 * math.pi))).sum(-1)
         return base + logdet
 
     @torch.no_grad()
-    def sample(self, n_samples, temperature=1.0, mean=None, std=None):
-        """Samples in the fit space; destandardized if `mean`/`std` are given."""
+    def sample(self, n_samples, temperature=1.0, mean=None, std=None, context=None):
+        """Samples in the fit space; destandardized if `mean`/`std` are given (the dim
+        sampled columns only). A conditional flow draws one sample per row of the
+        (standardized) `context`, which then sets n_samples."""
         p = next(self.parameters())
+        if self.context_dim:
+            if context is None:
+                raise ValueError("a conditional flow needs a context to sample")
+            context = torch.as_tensor(context, device=p.device, dtype=p.dtype)
+            n_samples = context.shape[0]
         z = torch.randn(int(n_samples), self.dim, device=p.device, dtype=p.dtype) * temperature
         for layer in reversed(self.layers):
-            z = layer.inverse(z)
+            z = layer.inverse(z, context)
         if mean is not None and std is not None:
             mean = torch.as_tensor(mean, device=z.device, dtype=z.dtype).view(1, self.dim)
             std = torch.as_tensor(std, device=z.device, dtype=z.dtype).view(1, self.dim)

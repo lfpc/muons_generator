@@ -1,5 +1,5 @@
 """Plot and summarize the real muon sample: the raw columns, the quantities the
-generative models actually fit (pt, |dphi|, r, charge -- see train_flow_complete.py), and a
+generative models actually fit (|p|, theta, |dphi|, r, charge -- see train_flow_complete.py), and a
 corner plot of each set. Every histogram is weighted by the per-row importance weight, so
 what is shown is the physical (rate-weighted) distribution.
 
@@ -35,16 +35,19 @@ QUANTS = {
     'x': ('x [m]', False), 'y': ('y [m]', False), 'z': ('z [m]', False),
     'pdg': ('pdg', False), 'weight': ('weight', True),
     'pt': ('$P_t$ [GeV]', False), 'phi': (r'$\phi_p$ [rad]', False),
+    'p': ('$|P|$ [GeV]', False),
+    'theta': (r'$\theta = \arctan(P_t / P_z)$ [rad]', True),
     'r': ('r = hypot(x, y) [m]', True),
     'dphi': (r'$|\Delta\phi| = |\phi_p - \phi_r|$ [rad]', False),
     'charge': ('charge', False),
 }
 RAW = ('px', 'py', 'pz', 'x', 'y', 'z', 'pdg', 'weight')
-DERIVED = ('pt', 'phi', 'r', 'dphi', 'charge')
-PLOTTED = ('px', 'py', 'pz', 'x', 'y', 'z', 'pt', 'phi', 'r', 'dphi', 'charge', 'weight')
+DERIVED = ('pt', 'phi', 'p', 'theta', 'r', 'dphi', 'charge')
+PLOTTED = ('px', 'py', 'pz', 'x', 'y', 'z', 'pt', 'phi', 'p', 'theta', 'r', 'dphi', 'charge',
+           'weight')
 CORNER_RAW = ('x', 'y', 'z', 'px', 'py', 'pz')
-CORNER_GEN = ('pz', 'pt', 'dphi', 'r', 'z', 'charge')   # what train_flow_complete.py models
-NAMED_2D = (('pz', 'pt'), ('x', 'y'), ('r', 'pz'), ('r', 'dphi'))
+CORNER_GEN = ('p', 'theta', 'dphi', 'r', 'z', 'charge')  # what train_flow_complete.py models
+NAMED_2D = (('pz', 'pt'), ('p', 'theta'), ('x', 'y'), ('r', 'pz'), ('r', 'dphi'))
 FIXED = {'charge': (-1.5, 1.5, 3)}                  # charge takes two values: 3 bins, not 120
 MARGINALS = (('x', 'y', 'z'), ('px', 'py', 'pz'))   # draw_marginals grid, positions over momenta
 WEIGHT_BREAKS = (1e-7, 1e-2, 1.0)                   # *_per_weight.png split points
@@ -67,6 +70,8 @@ def chunks(path, num_samples=None, chunk=CHUNK):
             q['weight'] *= scale
             q['pt'] = calc_pt(q['px'], q['py'])
             q['phi'] = calc_phi(q['px'], q['py'])
+            q['p'] = np.hypot(q['pt'], q['pz'])
+            q['theta'] = np.arctan2(q['pt'], q['pz'])     # the model fits log(tan theta)
             q['r'] = np.hypot(q['x'], q['y'])
             dphi = q['phi'] - np.arctan2(q['y'], q['x'])
             q['dphi'] = np.abs((dphi + np.pi) % (2 * np.pi) - np.pi)
@@ -542,6 +547,7 @@ if __name__ == "__main__":
     draw_1d(h1, bins, 'phi', 'phi_dist.png', savefig, show, log_y=False)
 
     # the quantities the models generate
+    draw_2d(h2, bins, 'p', 'theta', 'momentum_p_theta.png', savefig, show)
     draw_1d(h1, bins, 'r', 'radius_dist.png', savefig, show)
     draw_1d(h1, bins, 'dphi', 'dphi_dist.png', savefig, show)
     draw_1d(h1, bins, 'charge', 'charge_dist.png', savefig, show, log_y=False)
