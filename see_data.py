@@ -32,12 +32,12 @@ GEN_SAMPLES = 5_000_000        # draws used to illustrate the beam-spot generato
 # as the generator's flows fit them (fit_space.py).
 QUANTS = {
     'px': ('$P_x$ [GeV]', False), 'py': ('$P_y$ [GeV]', False), 'pz': ('$P_z$ [GeV]', False),
-    'x': ('x [m]', False), 'y': ('y [m]', False), 'z': ('z [m]', False),
+    'x': ('x [cm]', False), 'y': ('y [cm]', False), 'z': ('z [cm]', False),
     'pdg': ('pdg', False), 'weight': ('weight', True),
     'pt': ('$P_t$ [GeV]', False), 'phi': (r'$\phi_p$ [rad]', False),
     'p': ('$|P|$ [GeV]', False),
     'theta': (r'$\theta = \arctan(P_t / P_z)$ [rad]', True),
-    'r': ('r = hypot(x, y) [m]', True),
+    'r': ('r = hypot(x, y) [cm]', True),
     'dphi': (r'$|\Delta\phi| = |\phi_p - \phi_r|$ [rad]', False),
     'charge': ('charge', False),
 }
@@ -564,8 +564,8 @@ if __name__ == "__main__":
     fig, ax = plt.subplots(figsize=(10, 5))
     _, _, _, im = ax.hist2d(gen_x, gen_y, bins=200, cmap='viridis', norm=LogNorm())
     fig.colorbar(im, ax=ax, label='Counts')
-    ax.set_xlabel('x [m]', fontsize=fontsize)
-    ax.set_ylabel('y [m]', fontsize=fontsize)
+    ax.set_xlabel('x [cm]', fontsize=fontsize)
+    ax.set_ylabel('y [cm]', fontsize=fontsize)
     ax.add_patch(plt.Circle((0, 0), 0.15, color='r', fill=False))
     ax.set_title(f'generate_position() ({GEN_SAMPLES:,} draws)', fontsize=fontsize)
     fig.tight_layout()

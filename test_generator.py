@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 import gen_eval as ge
-from generator import MuonGenerator
+from generator import DEFAULT_MODEL, load_generator, resolve_model
 from utils import get_real_muons
 
 
@@ -29,10 +29,14 @@ class ArgFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescripti
 
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=ArgFormatter)
-parser.add_argument("--momentum_flow", default="outputs/momentum_flow.pt", help="Stage-1 checkpoint")
-parser.add_argument("--position_flow", default="outputs/position_flow.pt", help="Stage-2 checkpoint")
+parser.add_argument("--model", default=None,
+                    help=f"Generator: a flow checkpoint (.pt, train_flow.py), or with --gmm a GMM muon generator spec (.json, gmm/fit_z.py). None = {DEFAULT_MODEL[False]}, or {DEFAULT_MODEL[True]} with --gmm")
+parser.add_argument("--gmm", action="store_true",
+                    help="--model is a GMM muon generator: figures go to gmm/outputs/figs/, "
+                         "named *_gmm.png")
 parser.add_argument("--momentum_temperature", type=float, default=1.0,
-                    help="Latent temperature of the momentum flow")
+                    help="Latent temperature of the flow's momentum part (for a GMM: the "
+                         "GMM's, which widens each component)")
 parser.add_argument("--data", default=ge.DEFAULT_DATA, help="Real muon file")
 parser.add_argument("--data_samples", type=int, default=None, help="Cap on the real muons read (None = all)")
 parser.add_argument("--num_samples", type=int, default=None,
@@ -45,11 +49,16 @@ parser.add_argument("--device", default=None, help="cuda / cpu (auto if omitted)
 parser.add_argument("--show", action="store_true", help="Show the figures as well")
 args = parser.parse_args()
 device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+args.model = resolve_model(args.model, args.gmm)
+kind = "gmm" if args.gmm else "flow"
+if args.gmm:
+    ge.figs_dir = "gmm/outputs/figs/"
+    ge.fig_suffix = "_gmm"
 os.makedirs(ge.figs_dir, exist_ok=True)
 
-gen_model = MuonGenerator(args.momentum_flow, args.position_flow, device)
-print(f"Generator: {args.momentum_flow} (temperature {args.momentum_temperature:g}) + "
-      f"{args.position_flow}, mu+ fraction {gen_model.mu_plus:.4f}, on {device}")
+gen_model = load_generator(args.model, device)
+print(f"Generator: {args.model} [{kind}] (momentum temperature {args.momentum_temperature:g}), "
+      f"mu+ fraction {gen_model.mu_plus:.4f}, on {device}")
 
 # ---- real side: the data, or the cache of everything the figures need from it ----
 if args.load_hists:
@@ -88,7 +97,7 @@ nll_data = get_real_muons(args.data, args.nll_rows)
 w = nll_data[:, 7].astype(np.float64)
 nll = -(w @ gen_model.log_prob(nll_data[:, :7])) / w.sum()
 print(f"\nRate-weighted NLL of {len(nll_data):,} real muons: {nll:.5f} nats/muon "
-      "(density in GeV^-3 m^-3 times P(charge))")
+      "(density in GeV^-3 cm^-3 times P(charge))")
 
 if not args.load_hists:
     ge.save_cache(args.hists)

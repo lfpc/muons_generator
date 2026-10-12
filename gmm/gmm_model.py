@@ -51,14 +51,19 @@ class GMM:
 
     def sample(self, n, seed=0, temperature=1.0):
         """(pz, pt). `temperature` scales every component's spread around its mean
-        (covariance x T^2), keeping the mixture weights."""
+        (covariance x T^2), keeping the mixture weights. `seed` is an int or a
+        np.random.Generator, which is then drawn from directly."""
         rng = np.random.default_rng(seed)
         comp = rng.choice(self.n_components, size=n, p=self.weights)
         z = rng.standard_normal((n, 2))
         xs = self.means[comp] + temperature * np.einsum("nij,nj->ni", self.chol[comp], z)
         return fit_to_momentum(xs * self.std + self.mean, self.bounds)
 
+    def log_pdf(self, pz, pt):
+        """Log density in (pz, pt) [GeV^-2]."""
+        uv, log_jac = momentum_to_fit(pz, pt, self.bounds)
+        return self.log_prob_std((uv - self.mean) / self.std) + log_jac - np.log(self.std).sum()
+
     def pdf(self, pzpt):
         """Density in (pz, pt) [GeV^-2]."""
-        uv, log_jac = momentum_to_fit(pzpt[:, 0], pzpt[:, 1], self.bounds)
-        return np.exp(self.log_prob_std((uv - self.mean) / self.std) + log_jac) / np.prod(self.std)
+        return np.exp(self.log_pdf(pzpt[:, 0], pzpt[:, 1]))

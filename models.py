@@ -198,7 +198,7 @@ class NeuralSplineFlow(nn.Module):
     quantities is the job of the script that defines it.
 
     With context_dim > 0 it is a conditional flow p(x | c): every coupling MLP also sees
-    the context c, which is not transformed (train_position_flow.py). log_prob takes
+    the context c, which is not transformed (MuonFlow's position part). log_prob takes
     the context separately or as the last context_dim columns of x, so rows [x, c] run
     through the training loop of flow_training.py unchanged."""
 
@@ -270,6 +270,62 @@ class NeuralSplineFlow(nn.Module):
         return z
 
 
+class MuonFlow(nn.Module):
+    """The whole muon as one flow, factorized in two stages over the standardized fit
+    space x = [u, v, a, b, c, q] (fit_space.py):
+
+        p(u, v, a, b, c | q) = p(u, v) * p(a, b, c | u, v, q)
+
+    `momentum` is an unconditional flow over (u, v), `position` a flow over (a, b, c)
+    conditioned on (u, v, q). The charge q is only a context (the generator draws it).
+    The momentum part models nothing else, so a latent temperature on it changes the
+    momentum distribution and leaves the position at a given momentum as it was.
+    One module, one set of weights, one checkpoint; log_prob takes rows [x] of the
+    training loop (flow_training.py) like a conditional NeuralSplineFlow with dim 5 and
+    context_dim 1."""
+
+    MOM, POS, Q = slice(0, 2), slice(2, 5), slice(5, 6)
+    dim, context_dim = 5, 1
+
+    def __init__(self, momentum, position):
+        """momentum / position: NeuralSplineFlow configs (dim and context_dim are set here)."""
+        super().__init__()
+        self.momentum = NeuralSplineFlow(**{**momentum, "dim": 2, "context_dim": 0})
+        self.position = NeuralSplineFlow(**{**position, "dim": 3, "context_dim": 3})
+
+    @property
+    def config(self):
+        return {"momentum": self.momentum.config, "position": self.position.config}
+
+    @classmethod
+    def from_config(cls, cfg):
+        return cls(**cfg)
+
+    def _position_context(self, x):
+        return torch.cat([x[:, self.MOM], x[:, self.Q]], 1)
+
+    def log_prob_momentum(self, x):
+        """log p(u, v) of rows x (standardized, at least the first 2 columns)."""
+        return self.momentum.log_prob(x[:, self.MOM])
+
+    def log_prob_position(self, x):
+        """log p(a, b, c | u, v, q) of rows x = [u, v, a, b, c, q] (standardized)."""
+        return self.position.log_prob(x[:, self.POS], self._position_context(x))
+
+    def log_prob(self, x):
+        """log p(u, v, a, b, c | q) of rows x = [u, v, a, b, c, q] (standardized)."""
+        return self.log_prob_momentum(x) + self.log_prob_position(x)
+
+    @torch.no_grad()
+    def sample(self, q, momentum_temperature=1.0):
+        """Rows [u, v, a, b, c, q] (standardized), one per entry of `q`, the standardized
+        charge column (n, 1). The temperature scales the momentum latent only."""
+        q = torch.as_tensor(q, device=next(self.parameters()).device).view(-1, 1)
+        uv = self.momentum.sample(q.shape[0], temperature=momentum_temperature).to(q.dtype)
+        abc = self.position.sample(0, context=torch.cat([uv, q], 1))
+        return torch.cat([uv, abc, q], 1)
+
+
 # ---------------------------------------------------------------------------
 # Checkpoints: one flat dict -- the flow's config and weights, the mean/std that
 # standardize its fit space, and the constants of that space (fit_space.py).
@@ -285,6 +341,7 @@ def save_flow(path, flow, state_dict, mean, std, **meta):
 def load_flow(path, device="cpu"):
     """(flow in eval mode on `device`, checkpoint dict)."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    flow = NeuralSplineFlow.from_config(ckpt["config"])
+    cls = MuonFlow if "momentum" in ckpt["config"] else NeuralSplineFlow
+    flow = cls.from_config(ckpt["config"])
     flow.load_state_dict(ckpt["state_dict"])
     return flow.to(device).eval(), ckpt

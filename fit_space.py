@@ -1,4 +1,4 @@
-"""Maps between physical muons and the fit spaces of the two flows.
+"""Maps between physical muons and the fit space of the muon flow (models.MuonFlow).
 
 A muon is (px, py, pz, x, y, z, pdg). The generator describes it by
 
@@ -17,7 +17,7 @@ import numpy as np
 
 TWO_PI = 2.0 * np.pi
 P_MAX = 400.0                 # |p| below the 400 GeV proton beam [GeV]
-R_SCALE, Z_SCALE = 2.0, 20.0  # where the asinh turns from linear to log [m]
+R_SCALE, Z_SCALE = 2.0, 20.0  # where the asinh turns from linear to log [cm]
 
 
 def logit_p(p, m):

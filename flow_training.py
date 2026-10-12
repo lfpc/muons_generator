@@ -1,6 +1,6 @@
 
-"""Data loading, standardization and the training loop shared by the two flows
-(train_momentum_flow.py, train_position_flow.py).
+"""Data loading, standardization and the training loop of the muon flow (train_flow.py;
+compare_gmm_flow.py uses the loop too).
 
 Every row carries its importance weight, and the loss is the rate-weighted NLL. The split
 file (split_by_weight.py) is read as its two groups and each batch mixes them, --hi_frac
@@ -16,7 +16,7 @@ import torch
 from tqdm import tqdm
 
 from gen_eval import figs_dir, plot_loss
-from models import NeuralSplineFlow, save_flow
+from models import save_flow
 from utils import CHUNK
 
 BAR_INTERVAL = 2.0       # seconds between tqdm refreshes, so a redirected log stays short
@@ -29,7 +29,7 @@ class ArgFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescripti
 
 
 def make_parser(doc, out):
-    """An argument parser with the flags both training scripts take."""
+    """An argument parser with the data and optimization flags of a training script."""
     p = argparse.ArgumentParser(description=doc, formatter_class=ArgFormatter)
     p.add_argument("--data", default=DEFAULT_SPLIT,
                    help="split_by_weight.py output, or the pooled table (utils.DEFAULT_DATA)")
@@ -38,8 +38,6 @@ def make_parser(doc, out):
                         "proportion, with the weights scaled so the rate is unchanged")
     p.add_argument("--hi_frac", type=float, default=0.5,
                    help="Split file only: fraction of each batch drawn from above_W")
-    p.add_argument("--n_layers", type=int, default=12, help="Coupling layers")
-    p.add_argument("--hidden", type=int, nargs="+", default=[128, 128], help="Widths of each coupling MLP")
     p.add_argument("--num_bins", type=int, default=12, help="Spline bins per dimension")
     p.add_argument("--tail_bound", type=float, default=6.0,
                    help="Spline box in standardized units: identity outside it, so the "
@@ -137,9 +135,12 @@ def standardize(data):
 def report_coverage(data, bound, columns):
     """Weight fraction of each column outside the spline box +-bound, per group: data
     the flow will essentially never reproduce, so anything but tiny numbers here means
-    the fit space (or --tail_bound) needs changing."""
+    the fit space (or --tail_bound) needs changing. `bound` is one value for all columns
+    or one per column."""
     dim = len(columns)
-    print(f"Weight outside the spline box (+-{bound:g} sigma):")
+    bound = np.broadcast_to(np.asarray(bound, dtype=float), (dim,))
+    print("Weight outside the spline box (+-bound sigma; bound "
+          + ", ".join(f"{name} {b:g}" for name, b in zip(columns, bound)) + "):")
     for k, A in data.items():
         out, wsum = np.zeros(dim), 0.0
         for c in chunks(A):
@@ -209,11 +210,6 @@ def eval_nll(flow, V, batch=1 << 20):
         total += -(w * flow.log_prob(x)).sum().item()
         wsum += w.sum().item()
     return total / wsum
-
-
-def make_flow(dim, args, device):
-    return NeuralSplineFlow(dim=dim, n_layers=args.n_layers, hidden=tuple(args.hidden),
-                            num_bins=args.num_bins, tail_bound=args.tail_bound).to(device)
 
 
 def fit(flow, train, val, args, device):

@@ -15,6 +15,7 @@ from scipy.stats import wasserstein_distance
 from utils import DEFAULT_DATA, get_real_muons, calc_pt
 
 figs_dir = 'outputs/figs/'
+fig_suffix = ''          # added to every figure's name, e.g. '_gmm'
 fontsize = 14
 
 # shared 2D histogram / density grid
@@ -217,7 +218,8 @@ def load_real(data_path=DEFAULT_DATA, num_samples=None, group=None):
 # --------------------------------------------------------------------------- #
 def save_plot(fig, fname):
     """Save a figure, track it, and report it immediately so progress is visible."""
-    path = figs_dir + fname
+    stem, ext = os.path.splitext(fname)
+    path = figs_dir + stem + fig_suffix + ext
     fig.savefig(path)
     saved_plots.append(path)
     print(f"  saved plot [{len(saved_plots)}]: {path}", flush=True)
@@ -302,7 +304,7 @@ Z_TARGET_END = -2.14 + 1.595
 
 def derived_position(arr):
     """(r, |dphi|, charge) from a physical array: radius, momentum azimuth relative to
-    the position azimuth, and charge -- what the position flow is fit on."""
+    the position azimuth, and charge -- what the flow's position part is fit on."""
     px, py, x, y, pdg = arr[:, 0], arr[:, 1], arr[:, 3], arr[:, 4], arr[:, 6]
     dphi = np.arctan2(py, px) - np.arctan2(y, x)
     return (np.hypot(x, y),
@@ -329,8 +331,8 @@ def plot_position_xy(real, gen, real_w=None, fname='position_xy.png', show=False
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
     for ax, H, title in ((axes[0], Hr, 'real'), (axes[1], Hg, 'generated')):
         im = ax.pcolormesh(bins, bins, H.T, cmap='viridis', norm=norm)
-        ax.set_xlabel('x [m]', fontsize=fontsize)
-        ax.set_ylabel('y [m]', fontsize=fontsize)
+        ax.set_xlabel('x [cm]', fontsize=fontsize)
+        ax.set_ylabel('y [cm]', fontsize=fontsize)
         ax.set_title(title, fontsize=fontsize)
         ax.set_aspect('equal')
     fig.colorbar(im, ax=axes.tolist(), label='density')
@@ -342,7 +344,7 @@ def plot_position_xy(real, gen, real_w=None, fname='position_xy.png', show=False
 
 
 def plot_position_marginals(real, gen, real_w=None, fname='marginals.png', show=False):
-    """1D marginals of everything the position flow and the charge describe --
+    """1D marginals of everything the flow's position part and the charge describe --
     x, y, z, r (log axis: it spans decades), |dphi| and charge -- plus the momentum
     components px, py, pz, which the position parameterization feeds into (px and py are
     pt rotated by the generated azimuth, so they are only right if r and |dphi| are).
@@ -385,16 +387,16 @@ def plot_position_marginals(real, gen, real_w=None, fname='marginals.png', show=
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 13.5), constrained_layout=True)
     m = {}
-    m['x'] = panel(axes[0, 0], 'x', lambda: real[:, 3], gen[:, 3], xb, 'x [m]',
+    m['x'] = panel(axes[0, 0], 'x', lambda: real[:, 3], gen[:, 3], xb, 'x [cm]',
                    w1_of=(lambda: real[:, 3], gen[:, 3]))
-    m['y'] = panel(axes[0, 1], 'y', lambda: real[:, 4], gen[:, 4], xb, 'y [m]',
+    m['y'] = panel(axes[0, 1], 'y', lambda: real[:, 4], gen[:, 4], xb, 'y [cm]',
                    w1_of=(lambda: real[:, 4], gen[:, 4]))
-    m['z'] = panel(axes[0, 2], 'z', lambda: real[:, 5], gen[:, 5], zb, 'z [m]',
+    m['z'] = panel(axes[0, 2], 'z', lambda: real[:, 5], gen[:, 5], zb, 'z [cm]',
                    w1_of=(lambda: real[:, 5], gen[:, 5]))
     for zline in (Z_TARGET, Z_TARGET_END):          # target markers, as in see_data.py
         axes[0, 2].axvline(zline, color='red', linestyle='--')
 
-    m['log10 r'] = panel(axes[1, 0], 'r', r_real, r_gen, rb, 'r = hypot(x, y) [m]',
+    m['log10 r'] = panel(axes[1, 0], 'r', r_real, r_gen, rb, 'r = hypot(x, y) [cm]',
                          logx=True,
                          w1_of=(lambda: np.log10(r_real()), np.log10(r_gen)))
     m['|dphi|'] = panel(axes[1, 1], 'dphi', dphi_real, dphi_gen, np.linspace(0, np.pi, 120),
@@ -444,7 +446,7 @@ def plot_radius_momentum(real, gen, real_w=None, fname='radius_Pz.png', show=Fal
             im = ax.pcolormesh(xb, rb, H.T, cmap='viridis', norm=norm)
             ax.set_yscale('log')
             ax.set_xlabel(xlabel, fontsize=fontsize)
-            ax.set_ylabel('r [m]', fontsize=fontsize)
+            ax.set_ylabel('r [cm]', fontsize=fontsize)
             ax.set_title(title, fontsize=fontsize)
         fig.colorbar(im, ax=axes[row, :].tolist(), label='density')
     fig.suptitle('Radius vs momentum and azimuth — real vs generated',
@@ -455,7 +457,7 @@ def plot_radius_momentum(real, gen, real_w=None, fname='radius_Pz.png', show=Fal
     plt.close(fig)
 
 
-CORNER_LABELS = ('x [m]', 'y [m]', 'z [m]', '$P_x$ [GeV]', '$P_y$ [GeV]', '$P_z$ [GeV]')
+CORNER_LABELS = ('x [cm]', 'y [cm]', 'z [cm]', '$P_x$ [GeV]', '$P_y$ [GeV]', '$P_z$ [GeV]')
 
 
 def _corner_columns(arr):
@@ -479,7 +481,7 @@ def _corner_bins(cols, n=70, tail_pct=99.9):
     for k, c in enumerate(cols):
         if CORNER_LABELS[k] == '$P_z$ [GeV]':
             bins.append(np.linspace(PZ_BINS[0], PZ_BINS[-1], n))
-        elif CORNER_LABELS[k] == 'z [m]':
+        elif CORNER_LABELS[k] == 'z [cm]':
             bins.append(np.linspace(c.min(), c.max(), n))
         else:
             lim = float(np.percentile(np.abs(c), tail_pct))
@@ -573,7 +575,7 @@ def plot_position_momentum(real, gen, real_w=None,
     plot's, one log color scale per row so the two panels are directly comparable."""
     G = _corner_columns(gen)
     bins = corner_bins(real)
-    rows = [(0, 3, 'x [m]', '$P_x$ [GeV]'), (1, 4, 'y [m]', '$P_y$ [GeV]')]
+    rows = [(0, 3, 'x [cm]', '$P_x$ [GeV]'), (1, 4, 'y [cm]', '$P_y$ [GeV]')]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 11), constrained_layout=True)
     for row, (ipos, imom, xlabel, ylabel) in enumerate(rows):

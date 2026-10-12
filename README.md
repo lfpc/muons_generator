@@ -5,19 +5,19 @@ muons `(px, py, pz, x, y, z, pdg)` with the distribution of the simulated sample
 `muons_data.h5` (2.3e9 rows, each with its own importance weight), so a downstream
 simulation can use as many muons as it needs.
 
-The generator has two stages, both small normalizing flows (rational-quadratic spline
-couplings, `models.py`):
+The generator is one normalizing flow (rational-quadratic spline couplings,
+`models.MuonFlow`), saved as one checkpoint, factorized in two stages:
 
 ```
-stage 1   momentum (pz, pt)    momentum flow       p(pz, pt)                      3.7k params
+stage 1   momentum (pz, pt)    momentum part       p(pz, pt)                      3.7k params
           charge q             Bernoulli           P(mu+) = 0.529 (rate-weighted)
           azimuth phi_p        uniform [0, 2pi)    px = pt cos phi_p, py = pt sin phi_p
-stage 2   position (x, y, z)   position flow       p(x, y, z | pz, pt, q)          7.8k params
+stage 2   position (x, y, z)   position part       p(x, y, z | pz, pt, q)          7.8k params
 ```
 
-The momentum is modelled on its own, so the momentum distribution can be changed (e.g.
-tempered) without touching the position distribution at a given momentum. The position
-flow models the production point relative to the momentum's azimuth (the beam is
+The momentum part is a flow of its own inside the model, so the momentum distribution can
+be changed (e.g. tempered) without touching the position distribution at a given momentum.
+The position part models the production point relative to the momentum's azimuth (the beam is
 azimuthally symmetric, so only that relative angle is physical).
 
 ## Using it
@@ -25,13 +25,13 @@ azimuthally symmetric, so only that relative angle is physical).
 ```python
 from generator import MuonGenerator
 
-gen = MuonGenerator(device="cuda")        # outputs/momentum_flow.pt + outputs/position_flow.pt
-muons = gen.sample(1_000_000)             # (n, 7) float32: px, py, pz [GeV], x, y, z [m], pdg
+gen = MuonGenerator(device="cuda")        # outputs/muon_flow.pt
+muons = gen.sample(1_000_000)             # (n, 7) float32: px, py, pz [GeV], x, y, z [cm], pdg
 muons = gen.sample(1_000_000, momentum_temperature=1.2)   # broader momentum spectrum
 log_p = gen.log_prob(muons)               # exact log density of physical muons
 ```
 
-`momentum_temperature` scales the momentum flow's latent (T > 1 broadens the spectrum:
+`momentum_temperature` scales the momentum part's latent (T > 1 broadens the spectrum:
 at T = 1.3 the 99th percentile of |p| goes from 108 to 179 GeV); the charge fraction and
 the position given the momentum are unchanged. Every generated muon has
 3 < |p| < 400 GeV and pz, pt > 0 by construction. 1e6 muons take ~0.65 s on a GPU.
@@ -42,16 +42,15 @@ the position given the momentum are unchanged. Every generated muon has
 |---|---|---|
 | split the data by weight | `python split_by_weight.py 0.01` | `muons_data_split.h5` (`above_W`, `below_W`) |
 | look at the data | `python see_data.py` | `outputs/figs/data_file/` |
-| train stage 1 | `python train_momentum_flow.py --p_min 3.0` | `outputs/momentum_flow.pt` |
-| train stage 2 | `python train_position_flow.py` | `outputs/position_flow.pt` |
+| train the flow | `python train_flow.py --p_min 3.0` | `outputs/muon_flow.pt` |
 | compare with the data | `python test_generator.py --load_hists` | `outputs/figs/*.png`, W1 and NLL |
 | downstream simulation | `python simulation_test.py` | hit rate, real vs generated |
 
-Both flows train on the whole split file: each batch mixes `above_W` (1.6e8 rows, almost
+The flow trains on the whole split file: each batch mixes `above_W` (1.6e8 rows, almost
 all of the rate) and `below_W` (2.2e9 rows, ~1e-4 of the rate), and the loss is the
-rate-weighted NLL. Training takes ~10 min (momentum) and ~35 min (position) on one L40S.
-The position flow takes its momentum bounds from `--momentum_flow`, so the two always
-match. `test_generator.py` caches the real side of every figure in
+rate-weighted NLL, the sum of the two stages' (they share no weights, so this is the
+same fit as training them apart). Training took ~10 min (momentum) + ~35 min (position)
+on one L40S when the stages were trained separately. `test_generator.py` caches the real side of every figure in
 `outputs/real_hists.npz`: run it once without `--load_hists` to build the cache.
 
 ## Files
@@ -59,11 +58,10 @@ match. `test_generator.py` caches the real side of every figure in
 | file | what it is |
 |---|---|
 | `generator.py` | `MuonGenerator`: the two stages, `sample()` and `log_prob()` |
-| `fit_space.py` | maps between physical muons and the flows' variables, with Jacobians |
-| `train_momentum_flow.py` | stage 1: p(u, v) |
-| `train_position_flow.py` | stage 2: p(\|dphi\|, asinh r, asinh z \| u, v, q) |
-| `models.py` | the Neural Spline Flow (optionally conditional) and its checkpoints |
-| `flow_training.py` | data loading, weighted batching and the training loop of both flows |
+| `fit_space.py` | maps between physical muons and the flow's variables, with Jacobians |
+| `train_flow.py` | trains the flow: p(u, v) p(\|dphi\|, asinh r, asinh z \| u, v, q) |
+| `models.py` | the Neural Spline Flow (optionally conditional), `MuonFlow`, checkpoints |
+| `flow_training.py` | data loading, weighted batching and the training loop |
 | `test_generator.py` | real vs generated figures, W1 distances, NLL |
 | `gen_eval.py` | the plots and metrics, with the real-side cache |
 | `simulation_test.py` | runs real and generated muons through the transport simulation (`cuda_muons_ship`) and compares the hit rates |
@@ -72,16 +70,16 @@ match. `test_generator.py` caches the real side of every figure in
 | `gmm/` | a Gaussian-mixture baseline for the momentum (below) |
 | `compare_gmm_flow.py` | GMM vs flow on the momentum, by model size |
 
-## The fit spaces (`fit_space.py`)
+## The fit space (`fit_space.py`)
 
 - **momentum** `u = logit((|p| - p_min) / (p_max - p_min))`, `v = log(pt / pz)`, with
   `p_max = 400 GeV` (the beam) and `p_min = 3 GeV`: the bounds hold by construction.
-- **position** `a = |phi_p - phi_r|`, `b = asinh(r / 2 m)`, `c = asinh((z - z0) / 20 m)`,
+- **position** `a = |phi_p - phi_r|`, `b = asinh(r / 2 cm)`, `c = asinh((z - z0) / 20 cm)`,
   conditioned on `(u, v, q)`. The sign of `phi_p - phi_r` is independent of the charge
   in the data (P > 0 is 0.501 for both), so it is drawn at random.
 
 Every map carries its Jacobian, so `MuonGenerator.log_prob` is the exact density in
-`(px, py, pz, x, y, z)` [GeV^-3 m^-3] times P(charge), and NLLs of different models
+`(px, py, pz, x, y, z)` [GeV^-3 cm^-3] times P(charge), and NLLs of different models
 compare directly whatever their internal variables.
 
 ## How well it matches the data
@@ -96,7 +94,7 @@ compare directly whatever their internal variables.
 NLL of 5e6 real muons is 14.6405 nats/muon, and <cos dphi> is 0.0240 generated vs
 0.0250 real. Known imperfections, all at a small fraction of the rate:
 
-- **\|dphi\| wiggles** of up to 5% around the real curve. The position flow's spline box
+- **\|dphi\| wiggles** of up to 5% around the real curve. The position part's spline box
   (+-9 sigma, 12 bins) is much wider than the data in \|dphi\| (~3.5 sigma), so only 2-3
   bins describe it; a tighter `--tail_bound` or more `--num_bins` should smooth it.
 - **pt tail beyond the data**: generated pt reaches ~13 GeV at densities of 1e-7-1e-8,
@@ -132,7 +130,7 @@ All numbers are rate-weighted NLLs [nats/muon] of real muons.
 
 ## GMM baseline (`gmm/`)
 
-`gmm_model.py` is a numpy-only mixture in the momentum flow's space (JSON in, samples and
+`gmm_model.py` is a numpy-only mixture in the momentum part's space (JSON in, samples and
 densities out); `train_gmm.py` fits it by weighted EM on the GPU over every row of the
 data, `test_gmm.py` compares it with the data. `gmm/outputs/gmm_model.json` is K = 32,
 fit on every row.
