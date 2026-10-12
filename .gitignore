@@ -12,10 +12,6 @@ outputs/
 *.pth
 *.pkl
 
-# figures
-*.png
-*.pdf
-
 # logs
 *.log
 nohup.out
