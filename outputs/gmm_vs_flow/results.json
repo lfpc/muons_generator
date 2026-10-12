@@ -1,0 +1,82 @@
+{
+ "gmm_8": {
+  "model": "gmm",
+  "K": 8,
+  "n_params": 223,
+  "test_nll": 14.875475775378762,
+  "test_nll_charge_exact": 14.80702992809231,
+  "train_time_s": 26.980060338974,
+  "sample_time_gpu_s": 0.0012993589916732162,
+  "sample_time_cpu_s": 0.06691152098937891,
+  "n_test": 138672919
+ },
+ "gmm_32": {
+  "model": "gmm",
+  "K": 32,
+  "n_params": 895,
+  "test_nll": 14.754080862839922,
+  "test_nll_charge_exact": 14.721636490502126,
+  "train_time_s": 105.1813018321991,
+  "sample_time_gpu_s": 0.0011018319928552955,
+  "sample_time_cpu_s": 0.07782178599154577,
+  "n_test": 138672919
+ },
+ "gmm_128": {
+  "model": "gmm",
+  "K": 128,
+  "n_params": 3583,
+  "test_nll": 14.695066024820271,
+  "test_nll_charge_exact": 14.678721846526626,
+  "train_time_s": 389.55558729171753,
+  "sample_time_gpu_s": 0.00110066999332048,
+  "sample_time_cpu_s": 0.08831624098820612,
+  "n_test": 138672919
+ },
+ "flow_8_L12": {
+  "model": "flow",
+  "hidden": 8,
+  "n_params": 13236,
+  "test_nll": 14.640592495638256,
+  "val_nll_fit_space": 7.516969753739811,
+  "train_time_s": 1054.86314535141,
+  "sample_time_gpu_s": 0.8986728260060772,
+  "sample_time_cpu_s": 3.5896309629897587,
+  "n_test": 138672919,
+  "n_layers": 12
+ },
+ "flow_16_L12": {
+  "model": "flow",
+  "hidden": 16,
+  "n_params": 26676,
+  "test_nll": 14.639276096321852,
+  "val_nll_fit_space": 7.515104102496842,
+  "train_time_s": 932.8395552635193,
+  "sample_time_gpu_s": 0.9202199270075653,
+  "sample_time_cpu_s": 3.936581854010001,
+  "n_test": 138672919,
+  "n_layers": 12
+ },
+ "gmm_512": {
+  "model": "gmm",
+  "K": 512,
+  "n_params": 14335,
+  "test_nll": 14.669138029315992,
+  "test_nll_charge_exact": 14.660724118357018,
+  "train_time_s": 1718.7755687236786,
+  "sample_time_gpu_s": 0.0011070800246670842,
+  "sample_time_cpu_s": 0.10113282900420018,
+  "n_test": 138672919
+ },
+ "flow_32_L12": {
+  "model": "flow",
+  "hidden": 32,
+  "n_params": 58164,
+  "test_nll": 14.6378347807574,
+  "val_nll_fit_space": 7.514373669931856,
+  "train_time_s": 1035.8353066444397,
+  "sample_time_gpu_s": 0.942132326978026,
+  "sample_time_cpu_s": 4.285644519986818,
+  "n_test": 138672919,
+  "n_layers": 12
+ }
+}

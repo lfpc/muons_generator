@@ -1,0 +1,8 @@
+{
+  "description": "GMM muon generator (gmm/muon_gmm.py); positions in cm",
+  "gmm": "gmm_model.json",
+  "z": "z_beta_fit.json",
+  "mu_plus_fraction": 0.5294400048482106,
+  "radius": 5.0,
+  "sigma": 1.6
+}

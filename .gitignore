@@ -7,7 +7,6 @@
 *.csv
 
 # models, histogram caches, results
-outputs/
 *.pt
 *.pth
 *.pkl
